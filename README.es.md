@@ -221,7 +221,7 @@ node watchdog/harden-hooks.js ~/.claude/plugins/cache/thedotmack/claude-mem/<ver
 
 Un `exit 1` dentro del comando original ahora solo termina la subshell, y el `exit 0` final se ejecuta igual — así que un worker muerto te cuesta unas cuantas observaciones, no la capacidad de escribir. Es idempotente; repítelo tras actualizar el plugin, porque la caché se sobrescribe.
 
-**2. Watchdog — la recuperación.** [`claude-mem-watchdog.ps1`](watchdog/claude-mem-watchdog.ps1) como tarea programada, cada 5 minutos: sondea `:37777` y, si no está sano, mata el worker colgado y lo relanza. No resucita el plugin si tú lo desactivaste, nunca toca tus sesiones de Claude Code, y omite al dueño del puerto salvo que sea realmente un worker de claude-mem — el proceso `.claude-mem-proxy` cae dentro de un filtro ingenuo `*claude-mem*` y no debe morir.
+**2. Watchdog — la recuperación.** [`claude-mem-watchdog.ps1`](watchdog/claude-mem-watchdog.ps1) como tarea programada, cada 5 minutos: sondea `:37777` y, si no está sano, mata el worker colgado y lo relanza. También comprueba el proxy de Ollama en `:11435` — ese corre en una ventana de consola, así que un Ctrl+C accidental lo mata y a partir de ahí el worker sigue reportándose sano mientras cada petición de generación falla en silencio. No resucita el plugin si tú lo desactivaste, nunca toca tus sesiones de Claude Code, y omite al dueño del puerto salvo que sea realmente un worker de claude-mem — el proceso `.claude-mem-proxy` cae dentro de un filtro ingenuo `*claude-mem*` y no debe morir.
 
 ```powershell
 $s = "$env:USERPROFILE\.claude-mem-watchdog\watchdog.ps1"

@@ -39,6 +39,31 @@ try {
 } catch { $enabled = $false }
 if (-not $enabled) { exit 0 }
 
+# 1a. The proxy claude-mem generates through. It runs in a console window, so
+# an accidental Ctrl+C kills it -- and then the worker looks healthy while every
+# generation request fails, which is worse than an obvious outage.
+$ProxyPort = 11435
+$proxyUp = $false
+try { $null = Get-NetTCPConnection -LocalPort $ProxyPort -State Listen -EA Stop; $proxyUp = $true } catch { }
+if (-not $proxyUp) {
+    Write-Log "ollama proxy down on :$ProxyPort -- restarting"
+    $node = (Get-Command node -EA SilentlyContinue).Source
+    $js   = Join-Path $Home_ '.claude-mem-proxy\proxy.js'
+    if ($node -and (Test-Path $js)) {
+        $env:CMP_PORT = "$ProxyPort"
+        $env:CMP_UPSTREAM = 'ollama.com'
+        $env:CMP_REASONING_EFFORT = 'none'
+        Start-Process -FilePath $node -ArgumentList "`"$js`"" -WindowStyle Hidden `
+            -RedirectStandardOutput (Join-Path $Home_ '.claude-mem-proxy\proxy.out.log') `
+            -RedirectStandardError  (Join-Path $Home_ '.claude-mem-proxy\proxy.err.log')
+        Start-Sleep -Seconds 4
+        try { $null = Get-NetTCPConnection -LocalPort $ProxyPort -State Listen -EA Stop; Write-Log '  proxy back up' }
+        catch { Write-Log '  proxy did not come up' }
+    } else {
+        Write-Log '  node or proxy.js missing -- skipped'
+    }
+}
+
 # 2. Healthy? Then there is nothing to do.
 try {
     $r = Invoke-WebRequest "http://localhost:$Port" -TimeoutSec 5 -UseBasicParsing

@@ -214,7 +214,7 @@ node watchdog/harden-hooks.js ~/.claude/plugins/cache/thedotmack/claude-mem/<版
 
 原命令里的 `exit 1` 现在只结束子 shell，末尾的 `exit 0` 照常执行 —— 于是 worker 挂掉的代价是漏掉几条观察记录，而不是夺走你打字的能力。幂等；插件更新后需重新执行，因为缓存会被覆盖。
 
-**2. 看门狗 —— 恢复。** 把 [`claude-mem-watchdog.ps1`](watchdog/claude-mem-watchdog.ps1) 注册为计划任务，每 5 分钟探测 `:37777`，不健康就杀掉卡死的 worker 并重启。若你主动禁用了插件，它不会擅自复活；它绝不碰你的 Claude Code 会话；除非端口占用者确实是 claude-mem worker，否则一律跳过 —— `.claude-mem-proxy` 进程会被幼稚的 `*claude-mem*` 过滤器命中，绝不能误杀。
+**2. 看门狗 —— 恢复。** 把 [`claude-mem-watchdog.ps1`](watchdog/claude-mem-watchdog.ps1) 注册为计划任务，每 5 分钟探测 `:37777`，不健康就杀掉卡死的 worker 并重启。它同时检查 `:11435` 上的 Ollama 代理 —— 那个跑在控制台窗口里，一次误触 Ctrl+C 就会杀掉它，之后 worker 仍报告健康，而每一次生成请求都在悄悄失败。若你主动禁用了插件，它不会擅自复活；它绝不碰你的 Claude Code 会话；除非端口占用者确实是 claude-mem worker，否则一律跳过 —— `.claude-mem-proxy` 进程会被幼稚的 `*claude-mem*` 过滤器命中，绝不能误杀。
 
 ```powershell
 $s = "$env:USERPROFILE\.claude-mem-watchdog\watchdog.ps1"
