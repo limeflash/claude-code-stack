@@ -1,46 +1,89 @@
-# Session bootstrap prompts
+# Prompt playbook
 
-`CLAUDE.md` already tells the agent the rules on every session — these are for when it is not installed yet, when you are on someone else's machine, or when you want the agent to *prove* the stack works before trusting it.
+The four everyday prompts live in the README, translated into every language: [English](README.md#prompts-to-paste) · [Русский](README.ru.md#промпты-для-вставки) · [中文](README.zh-CN.md#可直接粘贴的提示词) · [Español](README.es.md#prompts-para-pegar).
 
-Language does not matter; paste them in whatever you normally write in.
-
----
-
-## 1. Orientation — paste at the start of a session in a new repo
-
-> This machine has two code-intelligence servers. Use them instead of grepping the tree or reading whole files.
->
-> **The graph (`codebase-memory-mcp`) answers questions. Serena makes changes.**
->
-> 1. Call `list_projects` first. If the repo I'm working in is not indexed, index it with `index_repository` before doing anything else.
-> 2. For "where is X / who calls X / how is this built / what breaks if I change X" use `get_architecture`, `search_graph`, `trace_path`, `query_graph`, `semantic_query`, `get_code_snippet`. These are instant — do not fall back to Grep/Glob for structural questions.
-> 3. Before you edit a symbol, get exact references with Serena's `find_referencing_symbols`. Make the edit with `replace_symbol_body` / `insert_after_symbol` / `rename_symbol` / `safe_delete_symbol`, then check `get_diagnostics_for_file`.
-> 4. If the graph and the files disagree, the files win — re-index rather than trusting a stale answer.
->
-> Start by giving me a short architecture summary of this repo **from the graph**, and tell me if anything above was unavailable.
-
-That last sentence matters: it turns a silent missing-MCP into a visible report instead of the agent quietly grepping and pretending.
+This file holds the longer ones. Copy the block, replace anything in `<angle brackets>`, paste. Language does not matter — write in whatever you normally use.
 
 ---
 
-## 2. Health check — paste when something feels off
+## Land in an unfamiliar codebase
 
-> Check my setup and report what is actually broken, not what should be there:
-> - is the `codebase-memory-mcp` daemon active, and how many projects are indexed?
-> - is `serena` connected?
-> - does the claude-mem worker answer on `http://localhost:37777`?
-> - does `~/.claude-mem-proxy/proxy.log` show recent `-> 200 [reasoning_effort=none]` lines?
->
-> For anything failing, give me the cause and the fix — do not just restart things.
+```text
+I've just been dropped into this repo and know nothing about it. Using the code graph — not by reading files —
+give me:
+1. what this service actually does, and its entry points (HTTP routes, CLI commands, jobs, main functions);
+2. the 5-10 modules that matter most, judged by fan-in/fan-out rather than by folder names;
+3. the parts that look risky: highest fan-out symbols, obvious dead code, anything with a suspicious name;
+4. what I should read first if I have 20 minutes.
+Cite qualified symbol names so I can jump to them. Say explicitly which claims came from the graph and which
+are your inference.
+```
 
----
+## Plan a change before touching anything
 
-## 3. Onboarding a new machine
+```text
+I want to change <describe the change>.
+Before writing any code:
+1. use the graph to find every place involved, and trace_path to show the call chains that reach them;
+2. use Serena's find_referencing_symbols on each symbol you intend to modify — I want the exact reference
+   list, not a guess;
+3. tell me the blast radius: what breaks, what needs updating in lockstep, what is safe to leave alone;
+4. only then propose a plan, smallest diff first.
+Do not edit anything until I approve the plan.
+```
 
-> Read the README in this repo and set up the whole stack on this machine, in the order given. Stop and tell me before doing anything that needs a paid key. When you are done, run the health check and show me the result.
+## Safe refactor loop
 
----
+```text
+Refactor <symbol or module> to <goal>.
+Work symbol by symbol: find_referencing_symbols first, edit with replace_symbol_body / rename_symbol /
+safe_delete_symbol, then get_diagnostics_for_file on every file you touched before moving to the next symbol.
+If diagnostics come back non-empty, fix them before continuing — do not batch up broken states.
+When finished, re-index the repo so the graph matches reality, and summarise what changed.
+```
 
-## 4. Indexing a batch of repos
+## Review a diff with real context
 
-> Index every git repository under `<path>` into the code graph. Index each repo separately — do not index a parent folder that contains several of them, and skip empty stubs, archives, and folders that are only build output or datasets. Then show me the resulting project list with node and edge counts.
+```text
+Review my current diff. For each changed symbol, use detect_changes and the graph to find its callers, and
+tell me whether the change is safe for every one of them — not just the ones the diff touches.
+Flag anything that changes a contract (signature, return shape, thrown errors, nullability) without updating
+all call sites. Skip style opinions; I only want correctness and blast-radius findings.
+```
+
+## Find dead code honestly
+
+```text
+Find dead code in <project>. Use the graph for zero-in-degree symbols, but before reporting anything, verify
+each candidate against the source: check for dynamic dispatch, reflection, string-based lookups, DI
+registration, test-only usage, and public API surface that external consumers might import.
+Report two separate lists: "confirmed unreachable" and "looks unused but I could not prove it", with the
+reason for each in the second list. Do not delete anything.
+```
+
+## Cross-repo impact
+
+```text
+I'm about to change <symbol> in <repo A>. Several repos are indexed in the graph. Search all of them for
+call sites, HTTP routes, queue names, env var names, or shared type shapes that would be affected —
+cross-service links are exactly what the graph is for.
+List the affected repos with concrete locations. If nothing outside <repo A> is affected, say so plainly
+instead of padding the answer.
+```
+
+## Keep the graph honest
+
+```text
+Check whether the code graph still matches the working tree for this repo: compare list_projects / index_status
+against the current branch and recent commits. If it is stale, re-index. If new repos appeared under <path>,
+index each one separately.
+Report what you re-indexed and the node/edge counts before and after.
+```
+
+## When you suspect the agent is bluffing
+
+```text
+For your last answer, tell me for each claim whether it came from the code graph, from Serena/LSP, from
+actually reading the file, or from your own inference. For anything that was inference, either verify it with
+a tool now or withdraw it.
+```
