@@ -157,10 +157,15 @@ codebase-memory-mcp cli list_projects        # UI: http://127.0.0.1:9749
 图谱（codebase-memory-mcp）负责回答问题。Serena 负责修改代码。
 
 1. 先调用 list_projects。如果当前仓库未被索引，先用 index_repository 索引它，再做其他任何事。
+   如果已索引但本会话之外发生了大改动 —— git pull、切分支、rebase，或守护进程曾经停摆 —— 也要重新索引：
+   watcher 只有在实际运行时才保持图谱新鲜，而过期的图谱不会报错，只会悄悄骗你。
 2. 遇到"X 在哪 / 谁调用 X / 这是怎么搭的 / 改了 X 会坏什么"，使用 get_architecture、search_graph、
-   trace_path、query_graph、semantic_query、get_code_snippet。结构性问题不要退回去用 Grep/Glob。
-3. 修改某个符号前，先用 Serena 的 find_referencing_symbols 拿到精确引用。用 replace_symbol_body /
-   insert_after_symbol / rename_symbol / safe_delete_symbol 修改，然后执行 get_diagnostics_for_file。
+   trace_path、query_graph、get_code_snippet。语义搜索是 search_graph 的一种模式
+   （semantic_query=["a","b"]），不是独立工具。结构性问题不要退回去用 Grep/Glob。
+3. Serena 一次只持有一个项目。如果要修改的文件不在本会话的工作目录内，先调用
+   activate_project("<仓库路径>")，否则跑起来的是错误的 language server。然后用 find_referencing_symbols
+   拿到精确引用，用 replace_symbol_body / insert_after_symbol / rename_symbol / safe_delete_symbol 修改，
+   最后执行 get_diagnostics_for_file。
 4. 图谱与文件不一致时以文件为准 —— 重新索引，不要相信过期答案。
 
 请先基于图谱给我一份该仓库的简短架构概述，并告诉我上述哪些能力当前不可用。
@@ -206,6 +211,9 @@ codebase-memory-mcp cli list_projects        # UI: http://127.0.0.1:9749
 | `codebase-memory-mcp` 安装退出码 1，PATH 从未注册 | 单个 agent 配置失败会中断整个激活流程。`%LOCALAPPDATA%\hermes\config.yaml` 处的 **Hermes** 配置必然失败，与内容无关 —— [issue #1656](https://github.com/DeusData/codebase-memory-mcp/issues/1656) | 删除/改名该目录，或手动把安装目录加进 PATH。其他 agent 配置正常 |
 | `daemon status` 显示 "not running"，但 :9749 的 UI 有响应 | 多个守护进程互相竞争，通常来自反复 `install --force` | `daemon stop`，杀掉残留的 `codebase-memory-mcp.exe`，再执行一次 `daemon start` |
 | 图谱答案看起来过时 | `auto_watch=true` 只刷新**已索引**项目，而 `auto_index=false` —— 新仓库永远不会被自动收录 | 每个新仓库执行一次 `index_repository` |
+| Serena 在 TypeScript（或其他语言）文件上报 `Cannot extract symbols from <文件>. Active language servers: ['python']` | **不是缺少语言支持。** Serena 一次只持有一个项目并绑定到会话的工作目录，因此只启动了该项目的 language server | 调用 `activate_project("<仓库路径>")` 后重试。已验证：激活 TS 仓库后 `typescript` 服务器启动，符号提取正常 |
+| 智能体声称 `semantic_query` / `activate_project`「不存在」 | `semantic_query` 是 **`search_graph` 的参数**而非工具，所以在工具列表里搜不到。`activate_project` 确实存在，只是关键词检索排序靠后 | 用 `search_graph(semantic_query=["a","b"])`；按精确名称选择 `activate_project` |
+| 明明改了很多文件，`detect_changes` 却返回 `seed_symbols: 0` | 它对比的是 `base_branch`（默认 `main`）或 `since` —— 未提交的工作区改动解析不出符号 | 先提交，或传入正确的 `base_branch`/`since`，或改用 `trace_path` 评估影响面 |
 | `uv tool install --force` 报错：*"failed to remove directory … reparse point … (os error 4395)"* | 报错有误导性 —— 通常根本没有 reparse point。先停掉所有 `serena.exe`；仍失败则需强制删除目录 | `robocopy <空目录> <工具目录> /MIR`，再 `rmdir /s /q`，然后重装 |
 | PowerShell 5.1 脚本报 *"The property cannot be found on this object"* | 在 5.1 上，对 `ConvertFrom-Json` 对象中不存在的键做 `$json.NewKey = value` 会抛异常 | 改用 `Add-Member -NotePropertyName ... -Force` |
 | 路径变量变成了类似 `MSFT_TaskSettings3` 的东西 | PowerShell 变量名**不区分大小写** —— `$settings` 会悄悄覆盖 `$Settings` | 重命名其中一个 |

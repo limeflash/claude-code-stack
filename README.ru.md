@@ -157,13 +157,16 @@ codebase-memory-mcp cli list_projects        # UI: http://127.0.0.1:9749
 Граф (codebase-memory-mcp) отвечает на вопросы. Serena вносит изменения.
 
 1. Сначала вызови list_projects. Если этот репозиторий не проиндексирован — проиндексируй его через
-   index_repository прежде чего-либо ещё.
+   index_repository прежде чего-либо ещё. Если он проиндексирован, но снаружи этой сессии произошло что-то
+   крупное — git pull, смена ветки, ребейз или демон был выключен — переиндексируй тоже. Вотчер держит граф
+   свежим, только пока он реально работает, а устаревший граф врёт молча.
 2. Для «где X / кто вызывает X / как это устроено / что сломается, если поменять X» используй get_architecture,
-   search_graph, trace_path, query_graph, semantic_query, get_code_snippet. Не скатывайся в Grep/Glob на
-   структурных вопросах.
-3. Перед правкой символа возьми точные ссылки через find_referencing_symbols у Serena. Правь через
-   replace_symbol_body / insert_after_symbol / rename_symbol / safe_delete_symbol, затем выполни
-   get_diagnostics_for_file.
+   search_graph, trace_path, query_graph, get_code_snippet. Семантический поиск — это режим search_graph
+   (semantic_query=["a","b"]), а не отдельный инструмент. Не скатывайся в Grep/Glob на структурных вопросах.
+3. Serena держит один проект за раз. Если файл, который собираешься править, лежит вне рабочей директории
+   этой сессии — сначала вызови activate_project("<путь к репозиторию>"), иначе подняты не те language server'ы.
+   Затем возьми точные ссылки через find_referencing_symbols, правь через replace_symbol_body /
+   insert_after_symbol / rename_symbol / safe_delete_symbol и выполни get_diagnostics_for_file.
 4. Если граф и файлы расходятся — правда за файлами: переиндексируй, а не доверяй устаревшему ответу.
 
 Начни с краткой сводки по архитектуре этого репозитория из графа и скажи, если что-то из перечисленного
@@ -212,6 +215,9 @@ codebase-memory-mcp cli list_projects        # UI: http://127.0.0.1:9749
 | Установка `codebase-memory-mcp` завершается с кодом 1, PATH не прописывается | Сбой конфига одного агента прерывает всю активацию. Конфиг **Hermes** в `%LOCALAPPDATA%\hermes\config.yaml` падает детерминированно вне зависимости от содержимого — [issue #1656](https://github.com/DeusData/codebase-memory-mcp/issues/1656) | Удалить/переименовать эту папку либо прописать PATH вручную. Остальные агенты настраиваются нормально |
 | `daemon status` говорит «not running», а UI на :9749 отвечает | Конкурирующие демоны, обычно после повторных `install --force` | `daemon stop`, добить оставшиеся `codebase-memory-mcp.exe`, затем один `daemon start` |
 | Ответы графа выглядят устаревшими | `auto_watch=true` обновляет **проиндексированные** проекты, но `auto_index=false` — новые репозитории не подхватываются | Разовый `index_repository` на каждый новый репозиторий |
+| Serena падает с `Cannot extract symbols from <файл>. Active language servers: ['python']` на TypeScript-файле (или любом другом) | **Это не отсутствие поддержки языка.** Serena держит один проект за раз и привязывается к рабочей директории сессии, поэтому подняты language server'ы только этого проекта | `activate_project("<путь к репозиторию>")` и повторить. Проверено: после активации TS-репозитория поднимается `typescript`, символы извлекаются |
+| Агент утверждает, что `semantic_query` / `activate_project` «не существуют» | `semantic_query` — **параметр `search_graph`**, а не инструмент, поэтому поиск по списку инструментов его не находит. `activate_project` существует, просто поиск по ключевым словам ставит его низко | Вызывать `search_graph(semantic_query=["a","b"])`; `activate_project` выбирать по точному имени |
+| `detect_changes` возвращает `seed_symbols: 0` при куче изменённых файлов | Он сравнивает с `base_branch` (по умолчанию `main`) или `since` — незакоммиченные изменения рабочего дерева не разрешаются в символы | Сначала закоммитить, либо передать нужный `base_branch`/`since`, либо считать радиус через `trace_path` |
 | `uv tool install --force` падает: *«failed to remove directory … reparse point … (os error 4395)»* | Ошибка вводит в заблуждение — reparse point'а обычно нет. Сначала останови все `serena.exe`; если не помогло, каталог нужно удалять принудительно | `robocopy <пустая-папка> <каталог-инструмента> /MIR`, затем `rmdir /s /q`, затем установка заново |
 | Скрипт на PowerShell 5.1 падает с *«The property cannot be found on this object»* | `$json.NewKey = value` на 5.1 бросает исключение для ключей, которых нет в объекте `ConvertFrom-Json` | `Add-Member -NotePropertyName ... -Force` |
 | Переменная с путём превращается во что-то вроде `MSFT_TaskSettings3` | Имена переменных в PowerShell **регистронезависимы** — `$settings` молча затирает `$Settings` | Переименовать одну из них |

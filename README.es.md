@@ -157,11 +157,17 @@ Esta máquina tiene dos servidores de inteligencia sobre el código. Úsalos en 
 o leer archivos enteros. El grafo (codebase-memory-mcp) responde preguntas. Serena hace los cambios.
 
 1. Llama primero a list_projects. Si este repo no está indexado, indéxalo con index_repository antes que nada.
+   Si está indexado pero ha pasado algo grande fuera de esta sesión — git pull, cambio de rama, rebase, o el
+   demonio estuvo caído — reindéxalo también: el watcher solo mantiene el grafo fresco mientras está
+   corriendo, y un grafo caduco falla en silencio.
 2. Para "dónde está X / quién llama a X / cómo está construido / qué se rompe si cambio X" usa
-   get_architecture, search_graph, trace_path, query_graph, semantic_query, get_code_snippet. No recurras
-   a Grep/Glob para preguntas estructurales.
-3. Antes de editar un símbolo, obtén las referencias exactas con find_referencing_symbols de Serena. Edita con
-   replace_symbol_body / insert_after_symbol / rename_symbol / safe_delete_symbol y luego ejecuta
+   get_architecture, search_graph, trace_path, query_graph, get_code_snippet. La búsqueda semántica es un
+   modo de search_graph (semantic_query=["a","b"]), no una herramienta aparte. No recurras a Grep/Glob para
+   preguntas estructurales.
+3. Serena sostiene un solo proyecto a la vez. Si el archivo que vas a editar está fuera del directorio de
+   trabajo de esta sesión, llama antes a activate_project("<ruta del repo>"); si no, los language servers
+   activos son los equivocados. Después obtén las referencias exactas con find_referencing_symbols, edita con
+   replace_symbol_body / insert_after_symbol / rename_symbol / safe_delete_symbol y ejecuta
    get_diagnostics_for_file.
 4. Si el grafo y los archivos discrepan, mandan los archivos — reindexa en vez de fiarte de algo caduco.
 
@@ -212,6 +218,9 @@ Todos estos ocurrieron de verdad.
 | La instalación de `codebase-memory-mcp` sale con código 1 y el PATH nunca se registra | El fallo de la configuración de un solo agente aborta toda la activación. Una config de **Hermes** en `%LOCALAPPDATA%\hermes\config.yaml` falla de forma determinista, sea cual sea su contenido — [issue #1656](https://github.com/DeusData/codebase-memory-mcp/issues/1656) | Borra o renombra ese directorio, o añade el directorio de instalación al PATH a mano. El resto de agentes se configuran bien |
 | `daemon status` dice "not running" mientras la UI en :9749 responde | Demonios en competencia, normalmente por repetir `install --force` | `daemon stop`, mata los `codebase-memory-mcp.exe` que queden y lanza `daemon start` una vez |
 | Las respuestas del grafo parecen caducas | `auto_watch=true` refresca los proyectos **ya indexados**, pero `auto_index=false` — los repos nuevos nunca se recogen solos | Ejecuta `index_repository` una vez por repo nuevo |
+| Serena falla con `Cannot extract symbols from <archivo>. Active language servers: ['python']` en un archivo TypeScript (u otro) | **No es falta de soporte del lenguaje.** Serena sostiene un proyecto a la vez y se ancla al directorio de trabajo de la sesión, así que solo están levantados los language servers de ese proyecto | `activate_project("<ruta del repo>")` y reintenta. Verificado: al activar un repo TS arranca el servidor `typescript` y la extracción de símbolos funciona |
+| El agente afirma que `semantic_query` / `activate_project` «no existen» | `semantic_query` es un **parámetro de `search_graph`**, no una herramienta, así que buscarlo en la lista de herramientas falla. `activate_project` sí existe; una búsqueda por palabras clave simplemente lo posiciona mal | Usa `search_graph(semantic_query=["a","b"])`; selecciona `activate_project` por su nombre exacto |
+| `detect_changes` devuelve `seed_symbols: 0` pese a haber muchos archivos cambiados | Compara contra `base_branch` (por defecto `main`) o `since` — los cambios sin commitear del árbol de trabajo no resuelven a símbolos | Haz commit primero, pasa el `base_branch`/`since` correcto, o usa `trace_path` para el radio de impacto |
 | `uv tool install --force` falla: *"failed to remove directory … reparse point … (os error 4395)"* | Error engañoso — normalmente no hay ningún reparse point. Detén todos los `serena.exe`; si persiste, hay que borrar el directorio a la fuerza | `robocopy <dir-vacío> <dir-herramienta> /MIR`, luego `rmdir /s /q` y reinstala |
 | Un script de PowerShell 5.1 muere con *"The property cannot be found on this object"* | En 5.1, `$json.NewKey = value` lanza excepción para claves ausentes en un objeto de `ConvertFrom-Json` | `Add-Member -NotePropertyName ... -Force` |
 | Una variable de ruta se convierte en algo como `MSFT_TaskSettings3` | Los nombres de variable en PowerShell **no distinguen mayúsculas** — `$settings` pisa silenciosamente a `$Settings` | Renombra una de las dos |

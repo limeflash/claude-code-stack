@@ -157,12 +157,16 @@ This machine has two code-intelligence servers. Use them instead of grepping the
 The graph (codebase-memory-mcp) answers questions. Serena makes changes.
 
 1. Call list_projects first. If this repo is not indexed, index it with index_repository before anything else.
+   If it is indexed but anything big happened outside this session — git pull, branch switch, rebase, or the
+   daemon was down — re-index it as well. The watcher only keeps the graph fresh while it is actually running,
+   and a stale graph fails silently.
 2. For "where is X / who calls X / how is this built / what breaks if I change X" use get_architecture,
-   search_graph, trace_path, query_graph, semantic_query, get_code_snippet. Do not fall back to Grep/Glob
-   for structural questions.
-3. Before editing a symbol, get exact references with Serena's find_referencing_symbols. Edit with
-   replace_symbol_body / insert_after_symbol / rename_symbol / safe_delete_symbol, then run
-   get_diagnostics_for_file.
+   search_graph, trace_path, query_graph, get_code_snippet. Semantic search is a mode of search_graph
+   (semantic_query=["a","b"]), not a separate tool. Do not fall back to Grep/Glob for structural questions.
+3. Serena holds one project at a time. If the file you are about to edit lives outside this session's working
+   directory, call activate_project("<repo path>") first — otherwise the wrong language servers are running.
+   Then get exact references with find_referencing_symbols, edit with replace_symbol_body /
+   insert_after_symbol / rename_symbol / safe_delete_symbol, and run get_diagnostics_for_file.
 4. If the graph and the files disagree, the files win — re-index rather than trust a stale answer.
 
 Start with a short architecture summary of this repo from the graph, and tell me if anything above was unavailable.
@@ -209,6 +213,9 @@ Every one of these was hit for real.
 | `codebase-memory-mcp` install exits 1 and PATH is never registered | One failing agent config aborts activation. A **Hermes** config at `%LOCALAPPDATA%\hermes\config.yaml` fails deterministically regardless of contents — [issue #1656](https://github.com/DeusData/codebase-memory-mcp/issues/1656) | Remove/rename that dir, or add the install dir to PATH by hand. Other agents configure fine |
 | `daemon status` says "not running" while the UI on :9749 answers | Competing daemons, usually from repeated `install --force` | `daemon stop`, kill leftover `codebase-memory-mcp.exe`, `daemon start` once |
 | Graph answers look stale | `auto_watch=true` refreshes **indexed** projects, but `auto_index=false` — new repos are never picked up | Run `index_repository` once per new repo |
+| Serena fails with `Cannot extract symbols from <file>. Active language servers: ['python']` on a TypeScript (or other) file | **Not missing language support.** Serena holds one project at a time and binds to the session's working directory, so only that project's language servers are up | `activate_project("<repo path>")`, then retry. Verified: activating a TS repo brings up the `typescript` server and symbol extraction works |
+| Agent claims `semantic_query` / `activate_project` "do not exist" | `semantic_query` is a **parameter of `search_graph`**, not a tool — so searching the tool list for it fails. `activate_project` *does* exist; a keyword tool-search just ranks it poorly | Call `search_graph(semantic_query=["a","b"])`; select `activate_project` by exact name |
+| `detect_changes` returns `seed_symbols: 0` despite many changed files | It diffs against `base_branch` (default `main`) or `since` — uncommitted working-tree changes resolve to no symbols | Commit first, pass the right `base_branch`/`since`, or fall back to `trace_path` for blast radius |
 | `uv tool install --force` fails: *"failed to remove directory … reparse point … (os error 4395)"* | Misleading error — there is usually no reparse point. Stop every `serena.exe` first; if it persists, the directory needs a forced delete | `robocopy <empty-dir> <tool-dir> /MIR`, then `rmdir /s /q`, then install again |
 | PowerShell 5.1 script dies with *"The property cannot be found on this object"* | `$json.NewKey = value` throws on 5.1 for keys absent from a `ConvertFrom-Json` object | `Add-Member -NotePropertyName ... -Force` |
 | A path variable turns into something like `MSFT_TaskSettings3` | PowerShell variables are **case-insensitive** — `$settings` silently clobbers `$Settings` | Rename one |
