@@ -200,6 +200,33 @@ parent folder containing several of them — and skip empty stubs, archives, and
 output or datasets. Then show me the project list with node and edge counts.
 ```
 
+## Keeping claude-mem from blocking you
+
+claude-mem's `UserPromptSubmit` hook is **synchronous**. When the worker is unreachable it exits non-zero and Claude Code **blocks your prompt** — observed for real, 77 consecutive rejected prompts. The plugin marks its `PostToolUse`, `PreToolUse` and `Stop` hooks `"async": true`, which cannot block; the one hook standing between you and your keyboard is not.
+
+It gets stuck because the failure is self-perpetuating: the worker dies, its listening socket on `:37777` survives (inherited by a live child process), the launcher sees the port occupied and logs `Port already in use, refusing to start duplicate`, nothing answers health checks, so every hook fails — forever.
+
+Two layers, in [`watchdog/`](watchdog):
+
+**1. Hook hardening — the guarantee.** [`harden-hooks.js`](watchdog/harden-hooks.js) wraps the blocking hooks in a subshell:
+
+```bash
+node watchdog/harden-hooks.js ~/.claude/plugins/cache/thedotmack/claude-mem/<version>/hooks/hooks.json
+```
+
+An `exit 1` inside the original command now terminates only the subshell, and the trailing `exit 0` still runs — so a dead worker costs you some observations instead of your ability to type. Idempotent; re-apply after a plugin update, since the plugin cache is overwritten.
+
+**2. Watchdog — the recovery.** [`claude-mem-watchdog.ps1`](watchdog/claude-mem-watchdog.ps1) as a scheduled task, every 5 minutes: probes `:37777`, and if it is unhealthy kills the hung worker and respawns it. It refuses to resurrect the plugin if you disabled it, never touches your Claude Code sessions, and skips the port owner unless it is genuinely a claude-mem worker — the `.claude-mem-proxy` process matches a naive `*claude-mem*` filter and must not be killed.
+
+```powershell
+$s = "$env:USERPROFILE\.claude-mem-watchdog\watchdog.ps1"
+$a = New-ScheduledTaskAction -Execute powershell.exe -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$s`""
+$t = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 5)
+Register-ScheduledTask -TaskName claude-mem-watchdog -Action $a -Trigger $t
+```
+
+**Its honest limit:** if the socket is held by a *dead* PID, the handle was inherited by a live Claude Code session. The watchdog logs that and stops rather than killing your editor — that one clears when those sessions exit.
+
 ## Gotchas
 
 Every one of these was hit for real.
@@ -213,6 +240,8 @@ Every one of these was hit for real.
 | `codebase-memory-mcp` install exits 1 and PATH is never registered | One failing agent config aborts activation. A **Hermes** config at `%LOCALAPPDATA%\hermes\config.yaml` fails deterministically regardless of contents — [issue #1656](https://github.com/DeusData/codebase-memory-mcp/issues/1656) | Remove/rename that dir, or add the install dir to PATH by hand. Other agents configure fine |
 | `daemon status` says "not running" while the UI on :9749 answers | Competing daemons, usually from repeated `install --force` | `daemon stop`, kill leftover `codebase-memory-mcp.exe`, `daemon start` once |
 | Graph answers look stale | `auto_watch=true` refreshes **indexed** projects, but `auto_index=false` — new repos are never picked up | Run `index_repository` once per new repo |
+| **Prompts stop working**: `A hook blocked your prompt … claude-mem worker unreachable for N consecutive hooks` | The worker died, its `:37777` socket survived, the launcher refuses to spawn a duplicate, health checks fail — and the synchronous `UserPromptSubmit` hook blocks input. Self-perpetuating | Disable the plugin to type again, then apply [`watchdog/`](watchdog). See [the section above](#keeping-claude-mem-from-blocking-you) |
+| A port shows a listener whose PID does not exist (`taskkill: process not found`) | Orphaned socket — a child inherited the handle and outlived its owner | Kill the inheriting child; if it is a Claude Code session, the socket clears when that session exits |
 | Serena fails with `Cannot extract symbols from <file>. Active language servers: ['python']` on a TypeScript (or other) file | **Not missing language support.** Serena holds one project at a time and binds to the session's working directory, so only that project's language servers are up | `activate_project("<repo path>")`, then retry. Verified: activating a TS repo brings up the `typescript` server and symbol extraction works |
 | Agent claims `semantic_query` / `activate_project` "do not exist" | `semantic_query` is a **parameter of `search_graph`**, not a tool — so searching the tool list for it fails. `activate_project` *does* exist; a keyword tool-search just ranks it poorly | Call `search_graph(semantic_query=["a","b"])`; select `activate_project` by exact name |
 | `detect_changes` returns `seed_symbols: 0` despite many changed files | It diffs against `base_branch` (default `main`) or `since` — uncommitted working-tree changes resolve to no symbols | Commit first, pass the right `base_branch`/`since`, or fall back to `trace_path` for blast radius |
