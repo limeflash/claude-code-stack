@@ -223,7 +223,7 @@ $t = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInte
 Register-ScheduledTask -TaskName claude-mem-watchdog -Action $a -Trigger $t
 ```
 
-**它诚实的边界：** 如果套接字挂在一个**已不存在**的 PID 上，说明句柄被某个存活的 Claude Code 会话继承了。看门狗只记录并停手，而不会杀掉你的编辑器 —— 那种套接字会在相应会话退出时自行释放。
+**当端口属主 PID 已不存在时**，句柄是被某个比 worker 活得更久的子进程继承了。实测中那个子进程正是 claude-mem 自己的 Chroma 栈 —— `chroma-mcp.exe` 及其 python worker，在 worker 死后被遗弃 —— **而不是**编辑器会话。看门狗会杀掉它们，然后用真正的 bind 测试证明端口确实被收回，再重启 worker；`netstat` 里的 `LISTENING` 行两个方向都不能作为证据。若仍有它无法识别的进程占着端口，它会记录下来并停手，而不是乱杀一气。
 
 ## 坑
 
@@ -239,7 +239,7 @@ Register-ScheduledTask -TaskName claude-mem-watchdog -Action $a -Trigger $t
 | `daemon status` 显示 "not running"，但 :9749 的 UI 有响应 | 多个守护进程互相竞争，通常来自反复 `install --force` | `daemon stop`，杀掉残留的 `codebase-memory-mcp.exe`，再执行一次 `daemon start` |
 | 图谱答案看起来过时 | `auto_watch=true` 只刷新**已索引**项目，而 `auto_index=false` —— 新仓库永远不会被自动收录 | 每个新仓库执行一次 `index_repository` |
 | **提示词发不出去**：`A hook blocked your prompt … claude-mem worker unreachable for N consecutive hooks` | worker 已死但 `:37777` 套接字幸存，启动器拒绝启动副本，健康检查失败 —— 同步的 `UserPromptSubmit` 钩子于是阻塞输入。自我维持的死锁 | 先禁用插件恢复打字，再应用 [`watchdog/`](watchdog)。见[上一节](#别让-claude-mem-卡住你的输入) |
-| 端口的监听者 PID 根本不存在（`taskkill: process not found`） | 孤儿套接字 —— 句柄被子进程继承并比属主活得更久 | 杀掉继承句柄的子进程；若那是 Claude Code 会话，套接字会在其退出时释放 |
+| 端口的监听者 PID 根本不存在（`taskkill: process not found`） | 孤儿套接字 —— 句柄被子进程继承并比属主活得更久。对 claude-mem 而言元凶是它自己的 `chroma-mcp.exe` 和 python worker，在 worker 死后仍在运行 | 杀掉这些辅助进程，再用真正的 bind（`[System.Net.Sockets.TcpListener]`）确认 —— 最后一个句柄关闭前，`netstat` 仍会列出这个幽灵。无需重启 |
 | Serena 在 TypeScript（或其他语言）文件上报 `Cannot extract symbols from <文件>. Active language servers: ['python']` | **不是缺少语言支持。** Serena 一次只持有一个项目并绑定到会话的工作目录，因此只启动了该项目的 language server | 调用 `activate_project("<仓库路径>")` 后重试。已验证：激活 TS 仓库后 `typescript` 服务器启动，符号提取正常 |
 | 智能体声称 `semantic_query` / `activate_project`「不存在」 | `semantic_query` 是 **`search_graph` 的参数**而非工具，所以在工具列表里搜不到。`activate_project` 确实存在，只是关键词检索排序靠后 | 用 `search_graph(semantic_query=["a","b"])`；按精确名称选择 `activate_project` |
 | 明明改了很多文件，`detect_changes` 却返回 `seed_symbols: 0` | 它对比的是 `base_branch`（默认 `main`）或 `since` —— 未提交的工作区改动解析不出符号 | 先提交，或传入正确的 `base_branch`/`since`，或改用 `trace_path` 评估影响面 |

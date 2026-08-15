@@ -54,13 +54,41 @@ try { $owner = (Get-NetTCPConnection -LocalPort $Port -State Listen -EA Stop | S
 if ($owner) {
     $proc = Get-Process -Id $owner -EA SilentlyContinue
     if (-not $proc) {
-        # The classic case: socket outlived its owner, inherited by a live child.
-        # Killing the inheritor would mean killing a Claude Code session, so we
-        # only report it -- the socket clears when those sessions exit.
-        Write-Log "port held by dead PID $owner (orphaned socket); cannot reclaim without closing Claude Code sessions -- leaving it"
-        exit 0
+        # The socket outlived its owner: a child inherited the handle. Observed
+        # in practice, the inheritor is claude-mem's own Chroma stack
+        # (chroma-mcp.exe plus its python workers), orphaned when the worker
+        # died -- not a Claude Code session. Those are safe to kill, and doing
+        # so releases the port without touching the user's editor.
+        Write-Log "port held by dead PID $owner (orphaned socket); looking for orphaned claude-mem helpers"
+
+        $orphans = Get-CimInstance Win32_Process -EA SilentlyContinue | Where-Object {
+            $_.ProcessId -ne $PID -and (
+                $_.Name -eq 'chroma-mcp.exe' -or
+                ($_.Name -in @('python.exe', 'node.exe', 'bun.exe') -and
+                 $_.CommandLine -like '*chroma*' -and
+                 $_.CommandLine -notlike '*claude-mem-proxy*')
+            )
+        }
+        foreach ($o in $orphans) {
+            Write-Log "  killing orphaned helper PID $($o.ProcessId) ($($o.Name))"
+            Stop-Process -Id $o.ProcessId -Force -EA SilentlyContinue
+        }
+        Start-Sleep -Seconds 3
+
+        # Only a successful bind proves the port is actually reclaimed.
+        $free = $false
+        try {
+            $probe = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Parse('127.0.0.1'), $Port)
+            $probe.Start(); $probe.Stop(); $free = $true
+        } catch { }
+
+        if (-not $free) {
+            Write-Log "  port still held after cleanup -- leaving it rather than killing unknown processes"
+            exit 0
+        }
+        Write-Log "  port reclaimed"
     }
-    if ($proc.ProcessName -in @('bun', 'node')) {
+    elseif ($proc.ProcessName -in @('bun', 'node')) {
         $cl = (Get-CimInstance Win32_Process -Filter "ProcessId=$owner" -EA SilentlyContinue).CommandLine
         if ($cl -like '*claude-mem*' -and $cl -notlike '*claude-mem-proxy*') {
             Write-Log "killing hung worker PID $owner ($($proc.ProcessName))"
