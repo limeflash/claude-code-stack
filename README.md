@@ -216,7 +216,28 @@ node watchdog/harden-hooks.js ~/.claude/plugins/cache/thedotmack/claude-mem/<ver
 
 An `exit 1` inside the original command now terminates only the subshell, and the trailing `exit 0` still runs — so a dead worker costs you some observations instead of your ability to type. Idempotent; re-apply after a plugin update, since the plugin cache is overwritten.
 
-**2. Watchdog — the recovery.** [`claude-mem-watchdog.ps1`](watchdog/claude-mem-watchdog.ps1) as a scheduled task, every 5 minutes: probes `:37777`, and if it is unhealthy kills the hung worker and respawns it. It also checks the Ollama proxy on `:11435` — that one runs in a console window, so a stray Ctrl+C kills it, after which the worker still reports healthy while every generation request quietly fails. It refuses to resurrect the plugin if you disabled it, never touches your Claude Code sessions, and skips the port owner unless it is genuinely a claude-mem worker — the `.claude-mem-proxy` process matches a naive `*claude-mem*` filter and must not be killed.
+**2. Watchdog — the recovery.** [`claude-mem-watchdog.ps1`](watchdog/claude-mem-watchdog.ps1) as a scheduled task, every 5 minutes: probes `:37777`, and if it is unhealthy kills the hung worker and respawns it. It also checks the Ollama proxy on `:11435` — that one runs in a console window, so a stray Ctrl+C kills it, after which the worker still reports healthy while every generation request quietly fails.
+
+It exits immediately when no agent client is running, and again if you disabled the plugin — no client means no consumer, and a disabled plugin is a decision, not a fault. It holds a global mutex so a manual run and the scheduled one can never overlap: two copies once fought and one killed the healthy daemon the other had just started.
+
+## Keeping the code graph alive
+
+The `codebase-memory-mcp` daemon needs a **different mechanism**, and this is the trap: its daemon and CLI find each other through a named pipe whose name is a hash of the launching context.
+
+```
+started by Task Scheduler : cbm-daemon-bc0bed48…
+started from a session    : cbm-daemon-2a438ffc…
+```
+
+A daemon launched from a scheduled task therefore runs fine, holds the UI port, and is **permanently invisible** — `daemon status` reports "not running" next to a live process. The CLI then spawns a throwaway daemon per command, those race, the registry wedges, and the projects list comes back empty. The project `.db` files are never affected; only the registry is.
+
+So it is kept alive by a **Claude Code SessionStart hook** instead, which runs in the context where the pipe name matches: [`ensure-cbm-daemon.ps1`](watchdog/ensure-cbm-daemon.ps1) behind the fire-and-forget wrapper [`cbm-daemon-ensure.cmd`](watchdog/cbm-daemon-ensure.cmd). Copy both to `~/.claude/hooks/` and register the wrapper on every `SessionStart` matcher in `~/.claude/settings.json`:
+
+```json
+{ "type": "command", "command": "cmd.exe /d /v:off /s /c '\"\"%USERPROFILE%\\.claude\\hooks\\cbm-daemon-ensure.cmd\"\"'", "timeout": 10 }
+```
+
+The wrapper returns in ~40 ms with exit code 0 — it detaches the real work, so a slow or failing repair can never delay or block a session. And because it only runs when a session starts, the daemon exists exactly when something needs it. It refuses to resurrect the plugin if you disabled it, never touches your Claude Code sessions, and skips the port owner unless it is genuinely a claude-mem worker — the `.claude-mem-proxy` process matches a naive `*claude-mem*` filter and must not be killed.
 
 ```powershell
 $s = "$env:USERPROFILE\.claude-mem-watchdog\watchdog.ps1"
@@ -239,6 +260,7 @@ Every one of these was hit for real.
 | claude-mem stores nothing, no error shown | Reasoning model put text in `reasoning`, left `content` empty | The proxy's `reasoning_effort: "none"` |
 | `codebase-memory-mcp` install exits 1 and PATH is never registered | One failing agent config aborts activation. A **Hermes** config at `%LOCALAPPDATA%\hermes\config.yaml` fails deterministically regardless of contents — [issue #1656](https://github.com/DeusData/codebase-memory-mcp/issues/1656) | Remove/rename that dir, or add the install dir to PATH by hand. Other agents configure fine |
 | `daemon status` says "not running" while the UI on :9749 answers | Competing daemons, usually from repeated `install --force` | `daemon stop`, kill leftover `codebase-memory-mcp.exe`, `daemon start` once |
+| **The graph UI lists no projects**, or `daemon status` says "not running" while a `codebase-memory-mcp.exe` is clearly alive and serving `:9749` | The daemon was started from a context whose pipe-name hash differs from the CLI's — Task Scheduler is the usual culprit. It runs and is never found, so every CLI call spawns a throwaway daemon and those race until the registry wedges | Your data is fine — the per-project `.db` files are untouched. Kill every process flagged `--cbm-daemon-internal` (never the unflagged ones, those are session-owned MCP servers), then `daemon start` **from a terminal inside a session**. Automate it with the [SessionStart hook](#keeping-the-code-graph-alive) |
 | Graph answers look stale | `auto_watch=true` refreshes **indexed** projects, but `auto_index=false` — new repos are never picked up | Run `index_repository` once per new repo |
 | **Prompts stop working**: `A hook blocked your prompt … claude-mem worker unreachable for N consecutive hooks` | The worker died, its `:37777` socket survived, the launcher refuses to spawn a duplicate, health checks fail — and the synchronous `UserPromptSubmit` hook blocks input. Self-perpetuating | Disable the plugin to type again, then apply [`watchdog/`](watchdog). See [the section above](#keeping-claude-mem-from-blocking-you) |
 | A port shows a listener whose PID does not exist (`taskkill: process not found`) | Orphaned socket — a child inherited the handle and outlived its owner. For claude-mem the culprit is its own `chroma-mcp.exe` + python workers, still running after the worker died | Kill those helpers, then confirm with an actual bind (`[System.Net.Sockets.TcpListener]`) — `netstat` still lists the ghost until the last handle closes. No reboot needed |

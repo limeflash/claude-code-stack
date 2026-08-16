@@ -221,7 +221,28 @@ node watchdog/harden-hooks.js ~/.claude/plugins/cache/thedotmack/claude-mem/<ver
 
 Un `exit 1` dentro del comando original ahora solo termina la subshell, y el `exit 0` final se ejecuta igual — así que un worker muerto te cuesta unas cuantas observaciones, no la capacidad de escribir. Es idempotente; repítelo tras actualizar el plugin, porque la caché se sobrescribe.
 
-**2. Watchdog — la recuperación.** [`claude-mem-watchdog.ps1`](watchdog/claude-mem-watchdog.ps1) como tarea programada, cada 5 minutos: sondea `:37777` y, si no está sano, mata el worker colgado y lo relanza. También comprueba el proxy de Ollama en `:11435` — ese corre en una ventana de consola, así que un Ctrl+C accidental lo mata y a partir de ahí el worker sigue reportándose sano mientras cada petición de generación falla en silencio. No resucita el plugin si tú lo desactivaste, nunca toca tus sesiones de Claude Code, y omite al dueño del puerto salvo que sea realmente un worker de claude-mem — el proceso `.claude-mem-proxy` cae dentro de un filtro ingenuo `*claude-mem*` y no debe morir.
+**2. Watchdog — la recuperación.** [`claude-mem-watchdog.ps1`](watchdog/claude-mem-watchdog.ps1) como tarea programada, cada 5 minutos: sondea `:37777` y, si no está sano, mata el worker colgado y lo relanza. También comprueba el proxy de Ollama en `:11435` — ese corre en una ventana de consola, así que un Ctrl+C accidental lo mata y a partir de ahí el worker sigue reportándose sano mientras cada petición de generación falla en silencio.
+
+Sale de inmediato si no hay ningún cliente de agente corriendo, y otra vez si desactivaste el plugin: sin cliente no hay consumidor, y un plugin desactivado es una decisión, no un fallo. Mantiene un mutex global para que una ejecución manual y la programada nunca se solapen: dos copias llegaron a pelearse y una mató el daemon sano que la otra acababa de levantar.
+
+## Mantener vivo el grafo de código
+
+El daemon de `codebase-memory-mcp` necesita **otro mecanismo**, y aquí está la trampa: su daemon y su CLI se encuentran mediante una tubería con nombre cuyo nombre es un hash del contexto de arranque.
+
+```
+arrancado por el Programador de tareas : cbm-daemon-bc0bed48…
+arrancado desde una sesión             : cbm-daemon-2a438ffc…
+```
+
+Por eso un daemon lanzado desde una tarea programada funciona perfectamente, ocupa el puerto de la UI y es **permanentemente invisible**: `daemon status` dice "not running" junto a un proceso vivo. Entonces la CLI levanta un daemon desechable por cada comando, esos compiten entre sí, el registro se atasca y la lista de proyectos sale vacía. Los archivos `.db` de cada proyecto nunca se ven afectados; lo que se rompe es el registro.
+
+Así que lo mantiene vivo un **hook SessionStart de Claude Code**, que corre en el contexto donde el nombre de la tubería sí coincide: [`ensure-cbm-daemon.ps1`](watchdog/ensure-cbm-daemon.ps1) tras el envoltorio "dispara y olvida" [`cbm-daemon-ensure.cmd`](watchdog/cbm-daemon-ensure.cmd). Copia ambos a `~/.claude/hooks/` y registra el envoltorio en cada matcher `SessionStart` de `~/.claude/settings.json`:
+
+```json
+{ "type": "command", "command": "cmd.exe /d /v:off /s /c '\"\"%USERPROFILE%\\.claude\\hooks\\cbm-daemon-ensure.cmd\"\"'", "timeout": 10 }
+```
+
+El envoltorio devuelve en ~40 ms con código 0 — desacopla el trabajo real, así que una reparación lenta o fallida nunca puede retrasar ni bloquear una sesión. Y como solo corre al iniciar una sesión, el daemon existe justo cuando algo lo necesita. No resucita el plugin si tú lo desactivaste, nunca toca tus sesiones de Claude Code, y omite al dueño del puerto salvo que sea realmente un worker de claude-mem — el proceso `.claude-mem-proxy` cae dentro de un filtro ingenuo `*claude-mem*` y no debe morir.
 
 ```powershell
 $s = "$env:USERPROFILE\.claude-mem-watchdog\watchdog.ps1"
@@ -244,6 +265,7 @@ Todos estos ocurrieron de verdad.
 | claude-mem no guarda nada y no muestra error | El modelo de razonamiento puso el texto en `reasoning` y dejó `content` vacío | El `reasoning_effort: "none"` del proxy |
 | La instalación de `codebase-memory-mcp` sale con código 1 y el PATH nunca se registra | El fallo de la configuración de un solo agente aborta toda la activación. Una config de **Hermes** en `%LOCALAPPDATA%\hermes\config.yaml` falla de forma determinista, sea cual sea su contenido — [issue #1656](https://github.com/DeusData/codebase-memory-mcp/issues/1656) | Borra o renombra ese directorio, o añade el directorio de instalación al PATH a mano. El resto de agentes se configuran bien |
 | `daemon status` dice "not running" mientras la UI en :9749 responde | Demonios en competencia, normalmente por repetir `install --force` | `daemon stop`, mata los `codebase-memory-mcp.exe` que queden y lanza `daemon start` una vez |
+| **La UI del grafo no lista ningún proyecto**, o `daemon status` dice "not running" mientras un `codebase-memory-mcp.exe` está claramente vivo y sirviendo `:9749` | El daemon se arrancó desde un contexto cuyo hash de nombre de tubería difiere del de la CLI — el Programador de tareas es el sospechoso habitual. Corre y nunca se encuentra, así que cada llamada de la CLI levanta un daemon desechable y esos compiten hasta atascar el registro | Tus datos están bien: los `.db` por proyecto están intactos. Mata todo proceso marcado `--cbm-daemon-internal` (nunca los que no lo llevan, esos son servidores MCP de sesiones abiertas) y luego `daemon start` **desde una terminal dentro de una sesión**. Automatízalo con el [hook SessionStart](#mantener-vivo-el-grafo-de-código) |
 | Las respuestas del grafo parecen caducas | `auto_watch=true` refresca los proyectos **ya indexados**, pero `auto_index=false` — los repos nuevos nunca se recogen solos | Ejecuta `index_repository` una vez por repo nuevo |
 | **Los prompts dejan de enviarse**: `A hook blocked your prompt … claude-mem worker unreachable for N consecutive hooks` | El worker murió, su socket en `:37777` sobrevivió, el lanzador se niega a crear un duplicado, los health checks fallan — y el hook síncrono `UserPromptSubmit` bloquea la entrada. Se retroalimenta | Desactiva el plugin para volver a escribir y aplica [`watchdog/`](watchdog). Ver [la sección anterior](#evitar-que-claude-mem-te-bloquee) |
 | Un puerto muestra un listener cuyo PID no existe (`taskkill: process not found`) | Socket huérfano — un hijo heredó el descriptor y sobrevivió a su dueño. En claude-mem el culpable es su propio `chroma-mcp.exe` y sus workers de python, aún vivos tras la muerte del worker | Mata esos ayudantes y confirma con un bind real (`[System.Net.Sockets.TcpListener]`) — `netstat` sigue listando el fantasma hasta que se cierra el último descriptor. No hace falta reiniciar |

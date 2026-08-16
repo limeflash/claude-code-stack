@@ -214,7 +214,28 @@ node watchdog/harden-hooks.js ~/.claude/plugins/cache/thedotmack/claude-mem/<版
 
 原命令里的 `exit 1` 现在只结束子 shell，末尾的 `exit 0` 照常执行 —— 于是 worker 挂掉的代价是漏掉几条观察记录，而不是夺走你打字的能力。幂等；插件更新后需重新执行，因为缓存会被覆盖。
 
-**2. 看门狗 —— 恢复。** 把 [`claude-mem-watchdog.ps1`](watchdog/claude-mem-watchdog.ps1) 注册为计划任务，每 5 分钟探测 `:37777`，不健康就杀掉卡死的 worker 并重启。它同时检查 `:11435` 上的 Ollama 代理 —— 那个跑在控制台窗口里，一次误触 Ctrl+C 就会杀掉它，之后 worker 仍报告健康，而每一次生成请求都在悄悄失败。若你主动禁用了插件，它不会擅自复活；它绝不碰你的 Claude Code 会话；除非端口占用者确实是 claude-mem worker，否则一律跳过 —— `.claude-mem-proxy` 进程会被幼稚的 `*claude-mem*` 过滤器命中，绝不能误杀。
+**2. 看门狗 —— 恢复。** 把 [`claude-mem-watchdog.ps1`](watchdog/claude-mem-watchdog.ps1) 注册为计划任务，每 5 分钟探测 `:37777`，不健康就杀掉卡死的 worker 并重启。它同时检查 `:11435` 上的 Ollama 代理 —— 那个跑在控制台窗口里，一次误触 Ctrl+C 就会杀掉它，之后 worker 仍报告健康，而每一次生成请求都在悄悄失败。
+
+没有任何 agent 客户端在运行时它立即退出；插件被你禁用时同样退出 —— 没有客户端就没有消费者，而禁用是决定，不是故障。它持有一个全局互斥量，确保手动运行和计划运行永不重叠：两个副本曾经互相打架，其中一个杀掉了另一个刚启动的健康守护进程。
+
+## 让代码图谱保持存活
+
+`codebase-memory-mcp` 守护进程需要**另一套机制**，这里有个陷阱：守护进程和 CLI 通过一个命名管道互相寻找，而管道名是**启动上下文的哈希**。
+
+```
+由计划任务启动 : cbm-daemon-bc0bed48…
+由会话内启动   : cbm-daemon-2a438ffc…
+```
+
+因此由计划任务启动的守护进程运行正常、占着 UI 端口，却**永远不可见** —— `daemon status` 在一个活着的进程旁边报告 "not running"。于是 CLI 每条命令都另起一个一次性守护进程，它们互相竞争，直到注册表卡死、项目列表变空。各项目的 `.db` 文件从不受影响，坏掉的只有注册表。
+
+所以改由 **Claude Code 的 SessionStart 钩子**维持它 —— 那个上下文里管道名是匹配的：[`ensure-cbm-daemon.ps1`](watchdog/ensure-cbm-daemon.ps1)，外加即发即忘的包装 [`cbm-daemon-ensure.cmd`](watchdog/cbm-daemon-ensure.cmd)。把两者复制到 `~/.claude/hooks/`，并在 `~/.claude/settings.json` 的每个 `SessionStart` matcher 上注册该包装：
+
+```json
+{ "type": "command", "command": "cmd.exe /d /v:off /s /c '\"\"%USERPROFILE%\\.claude\\hooks\\cbm-daemon-ensure.cmd\"\"'", "timeout": 10 }
+```
+
+包装约 40 毫秒即以退出码 0 返回 —— 真正的工作被分离出去，所以再慢或失败的修复也不会拖慢或阻塞会话。而且它只在会话启动时运行，守护进程正好在有人需要时才存在。若你主动禁用了插件，它不会擅自复活；它绝不碰你的 Claude Code 会话；除非端口占用者确实是 claude-mem worker，否则一律跳过 —— `.claude-mem-proxy` 进程会被幼稚的 `*claude-mem*` 过滤器命中，绝不能误杀。
 
 ```powershell
 $s = "$env:USERPROFILE\.claude-mem-watchdog\watchdog.ps1"
@@ -237,6 +258,7 @@ Register-ScheduledTask -TaskName claude-mem-watchdog -Action $a -Trigger $t
 | claude-mem 什么都没存，也没报错 | reasoning 模型把文本放进了 `reasoning`，`content` 为空 | 代理注入的 `reasoning_effort: "none"` |
 | `codebase-memory-mcp` 安装退出码 1，PATH 从未注册 | 单个 agent 配置失败会中断整个激活流程。`%LOCALAPPDATA%\hermes\config.yaml` 处的 **Hermes** 配置必然失败，与内容无关 —— [issue #1656](https://github.com/DeusData/codebase-memory-mcp/issues/1656) | 删除/改名该目录，或手动把安装目录加进 PATH。其他 agent 配置正常 |
 | `daemon status` 显示 "not running"，但 :9749 的 UI 有响应 | 多个守护进程互相竞争，通常来自反复 `install --force` | `daemon stop`，杀掉残留的 `codebase-memory-mcp.exe`，再执行一次 `daemon start` |
+| **图谱 UI 里项目列表为空**，或者 `daemon status` 报 "not running" 而 `codebase-memory-mcp.exe` 明明活着并在服务 `:9749` | 守护进程是从管道名哈希与 CLI 不一致的上下文启动的 —— 通常是计划任务。它在运行却永远找不到，于是每条 CLI 命令都另起一次性守护进程，彼此竞争直到注册表卡死 | 数据没事 —— 各项目的 `.db` 文件完好。杀掉所有带 `--cbm-daemon-internal` 标记的进程（只杀这些；不带标记的是会话自有的 MCP 服务器），然后**在会话内的终端里**执行 `daemon start`。用 [SessionStart 钩子](#让代码图谱保持存活)自动化 |
 | 图谱答案看起来过时 | `auto_watch=true` 只刷新**已索引**项目，而 `auto_index=false` —— 新仓库永远不会被自动收录 | 每个新仓库执行一次 `index_repository` |
 | **提示词发不出去**：`A hook blocked your prompt … claude-mem worker unreachable for N consecutive hooks` | worker 已死但 `:37777` 套接字幸存，启动器拒绝启动副本，健康检查失败 —— 同步的 `UserPromptSubmit` 钩子于是阻塞输入。自我维持的死锁 | 先禁用插件恢复打字，再应用 [`watchdog/`](watchdog)。见[上一节](#别让-claude-mem-卡住你的输入) |
 | 端口的监听者 PID 根本不存在（`taskkill: process not found`） | 孤儿套接字 —— 句柄被子进程继承并比属主活得更久。对 claude-mem 而言元凶是它自己的 `chroma-mcp.exe` 和 python worker，在 worker 死后仍在运行 | 杀掉这些辅助进程，再用真正的 bind（`[System.Net.Sockets.TcpListener]`）确认 —— 最后一个句柄关闭前，`netstat` 仍会列出这个幽灵。无需重启 |
