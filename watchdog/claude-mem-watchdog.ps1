@@ -188,10 +188,16 @@ $runner = Join-Path $plugin.FullName 'scripts\bun-runner.js'
 $svc    = Join-Path $plugin.FullName 'scripts\worker-service.cjs'
 Start-Detached "node `"$runner`" `"$svc`" start" | Out-Null
 
-Start-Sleep -Seconds 12
-try {
-    $r = Invoke-WebRequest "http://localhost:$WorkerPort" -TimeoutSec 5 -UseBasicParsing
-    Write-Log "  worker recovered: HTTP $($r.StatusCode)"
-} catch {
-    Write-Log "  worker still down after respawn"
+# Poll rather than sleep once. claude-mem's own cold-boot window is ~15s, so a
+# single 12s check reported "still down" for a worker that came up fine moments
+# later -- a wrong verdict about a correct repair is worse than no log line.
+$deadline = (Get-Date).AddSeconds(45)
+$up = $false
+while ((Get-Date) -lt $deadline) {
+    Start-Sleep -Seconds 5
+    try {
+        $r = Invoke-WebRequest "http://localhost:$WorkerPort" -TimeoutSec 5 -UseBasicParsing
+        if ($r.StatusCode -ge 200 -and $r.StatusCode -lt 500) { $up = $true; break }
+    } catch { }
 }
+if ($up) { Write-Log '  worker recovered' } else { Write-Log '  worker still down after 45s' }
