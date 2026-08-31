@@ -27,6 +27,7 @@ Cuatro herramientas que le dan a Claude Code memoria capaz de sobrevivir a una s
 - [El stack](#el-stack) · [Cómo encaja todo](#cómo-encaja-todo) · [Por qué dos herramientas de código](#por-qué-dos-herramientas-de-código)
 - [Instalación](#instalación) · [Verificación](#verificación)
 - [**Prompts para pegar**](#prompts-para-pegar) ← empieza aquí tras instalar
+- [**Cómo elegir el modelo**](#cómo-elegir-el-modelo) — medido, no supuesto
 - [**Dos semanas después**](#dos-semanas-después) — lo que realmente hizo
 - [Tropiezos](#tropiezos) · [Coste y consumo](#coste-y-consumo) · [Privacidad](#privacidad)
 
@@ -231,7 +232,8 @@ Sale de inmediato si no hay ningún cliente de agente corriendo, y también si d
 **Lánzalo mediante [`run-hidden.vbs`](watchdog/run-hidden.vbs), no directamente.** El Programador de tareas, al ejecutar una aplicación de consola en una sesión interactiva, hace parpadear una ventana en cada ejecución. Cada cinco minutos, encima de lo que estés haciendo — incluidos juegos a pantalla completa, de los que te saca. `wscript` no tiene consola propia y `Run(..., 0, False)` arranca el hijo oculto:
 
 ```powershell
-$vbs = "$env:USERPROFILE\.claude-mem-watchdogun-hidden.vbs"
+$vbs = "$env:USERPROFILE\.claude-mem-watchdog
+un-hidden.vbs"
 $a = New-ScheduledTaskAction -Execute wscript.exe -Argument "//nologo `"$vbs`""
 Set-ScheduledTask -TaskName claude-mem-watchdog -Action $a
 ```
@@ -265,6 +267,61 @@ Register-ScheduledTask -TaskName claude-mem-watchdog -Action $a -Trigger $t
 ```
 
 **Cuando el PID dueño del puerto está muerto**, el descriptor lo heredó un hijo que sobrevivió al worker. En la práctica ese hijo es el propio stack Chroma de claude-mem — `chroma-mcp.exe` y sus workers de python — huérfanos desde que murió el worker, y **no** una sesión del editor. El watchdog mata esos, y luego demuestra que el puerto quedó realmente libre con un bind de verdad antes de relanzar; una línea `LISTENING` en `netstat` no prueba nada en ninguna dirección. Si algo que no puede identificar sigue ocupando el puerto, lo registra y se detiene en vez de matar procesos al azar.
+
+## Cómo elegir el modelo
+
+La memoria vale lo que valga el modelo que la escribe, así que esto se midió en vez de suponerse: ocho sesiones reales de esta máquina, con la respuesta correcta conocida, puntuadas según si el resumen conservó el hecho que importaba.
+
+| | GLM-5.3-Flash | DeepSeek-V4-Flash |
+|---|---|---|
+| Hechos conservados | **10/10** | 7/10 |
+| Conexiones inventadas | 0 | 0 |
+| Tokens por llamada | ~510 | ~44 |
+| Latencia | 4,9 s | 0,9 s |
+
+Lo interesante es qué perdió DeepSeek. Se dejó el número `266` de «273 intentos, 266 fallos, 5 éxitos» y escribió un resumen que se contradice a sí mismo: *«273 intentos de reinicio dieron 5 éxitos, todos fallando»*. Registró que una tarea programada «falló con Access denied», pero no que lo que falló fue el principal S4U, así que el término buscable desaparece. Y en la sesión que costó dos horas entender, dijo que el watchdog «lo toma por un cuelgue» sin registrar que el apagado era **por diseño**, que era justamente todo el hallazgo.
+
+La latencia aquí da igual: la generación corre en el hook `Stop` en segundo plano y nadie la espera.
+
+### Los modelos que razonan necesitan el endpoint nativo
+
+Por el camino obvio GLM no funciona. El `/v1/chat/completions` compatible con OpenAI de Ollama no acepta el parámetro `think` ([ollama#15288](https://github.com/ollama/ollama/issues/15288), [#15293](https://github.com/ollama/ollama/issues/15293)), así que un modelo de razonamiento narra dentro de `content` —1300–1600 caracteres de «The user wants me to compress…», sin dar ni una vez el formato pedido en seis intentos— o, con `reasoning.enabled:false`, devuelve `content` vacío.
+
+El proxy lo resuelve traduciendo al `/api/chat` nativo. Tres detalles deciden si eso funciona:
+
+- **`think: true`, no `false`.** Contraintuitivo: `true` coloca la deliberación en su propio campo `thinking` y deja `content` para la respuesta; `false` se limita a reinsertar la misma cháchara en `content`.
+- **Margen de presupuesto** (`CMP_THINK_HEADROOM`, por defecto 1200). El `max_tokens` de quien llama presupuesta la *respuesta*, pero el modelo gasta tokens pensando primero. Sin margen muere a mitad de la deliberación siempre — por eso el intento ingenuo parecía que el modelo estaba roto.
+- **Un plan B** (`CMP_THINK_FALLBACK`, por defecto `deepseek-v4-flash:0731`). Un modelo que razona agota la cuota más rápido, así que es el primero al que se le niega el servicio. Ante cualquier 4xx/5xx el proxy reintenta con el modelo barato: lo peor es un resumen más flojo, nunca uno ausente.
+
+La selección es `CMP_THINK_MODELS` (por defecto `glm-*`), así que esto abre todos los modelos con razonamiento de Ollama. Una línea de log sana:
+
+```
+POST /v1/chat/completions -> 200 [native think] [thoughts dropped: 1349 ch]
+```
+
+### Cuánto cuesta en realidad
+
+En una suscripción, nada — y «tokens» es la unidad equivocada para razonar aquí.
+
+Ollama Cloud expone un **endpoint de uso no documentado** que zanja el asunto con números reales en vez de estimaciones:
+
+```bash
+curl -H "Authorization: Bearer $OLLAMA_API_KEY" https://ollama.com/api/usage
+```
+
+Devuelve `limits.session` y `limits.weekly` como fracciones de 0 a 1, más recuentos de peticiones por modelo, y `activity` de las últimas cuatro semanas. `POST /api/me` (POST, no GET) devuelve el plan.
+
+En la máquina que documenta este repositorio — plan Pro, memoria funcionando de continuo durante dos semanas:
+
+| | |
+|---|---|
+| Coste medido, 4 semanas | **$0.00000** |
+| Cuota semanal consumida | **0,5%** |
+| Proyección con GLM (~2× de consumo) | ~1% |
+
+Dos cosas hacen engañoso contar tokens. La cuota se pondera **por modelo, no por token**: en una comparación controlada GLM consumió unas 2× de cuota por llamada gastando *menos* tokens que DeepSeek. Y el medidor ignora por completo las peticiones pequeñas: el contador semanal marcaba 271 peticiones donde el log del proxy tenía miles.
+
+Así que con una suscripción, elige por calidad. La aritmética de tokens solo empieza a importar con un proveedor que cobre por token, o si `/api/usage` muestra que la fracción semanal sube de verdad.
 
 ## Dos semanas después
 

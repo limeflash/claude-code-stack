@@ -27,6 +27,7 @@ Four tools that give Claude Code memory surviving across sessions and a structur
 - [The stack](#the-stack) · [How it fits together](#how-it-fits-together) · [Why two code tools](#why-two-code-tools)
 - [Install](#install) · [Verify](#verify)
 - [**Prompts to paste**](#prompts-to-paste) ← start here after installing
+- [**Choosing the model**](#choosing-the-model) — measured, not guessed
 - [**Two weeks in**](#two-weeks-in) — what it actually did
 - [Gotchas](#gotchas) · [Cost and footprint](#cost-and-footprint) · [Privacy](#privacy)
 
@@ -97,7 +98,7 @@ cd claude-mem-ollama-proxy
 
 macOS/Linux: `./macos/install.sh`. Registers an at-logon task (no admin), points claude-mem at `http://127.0.0.1:11435/v1`, defaults to `deepseek-v4-flash:0731`. Another model: `-Model "gpt-oss:120b"` — list them at `https://ollama.com/v1/models`.
 
-It injects `reasoning_effort: "none"`. Without that a reasoning model returns its answer in `reasoning`, leaves `content` empty, and claude-mem silently stores nothing.
+It injects `reasoning_effort: "none"`. Without that a reasoning model returns its answer in `reasoning`, leaves `content` empty, and claude-mem silently stores nothing. For models that ignore that flag entirely, see [Choosing the model](#choosing-the-model) — the proxy routes them through Ollama's native endpoint instead.
 
 ### 3 · codebase-memory-mcp
 
@@ -261,6 +262,61 @@ Register-ScheduledTask -TaskName claude-mem-watchdog -Action $a -Trigger $t
 ```
 
 **When the port owner PID is dead**, the handle was inherited by a child that outlived the worker. In practice that child is claude-mem's own Chroma stack — `chroma-mcp.exe` and its python workers — orphaned when the worker died, *not* an editor session. The watchdog kills those, then proves the port is genuinely reclaimed with a bind test before respawning; a `LISTENING` row in `netstat` is not proof either way. If something it cannot identify still holds the port, it logs that and stops rather than killing processes at random.
+
+## Choosing the model
+
+The memory is only as good as the model that writes it, so this was measured rather than guessed: eight real sessions from this machine, ground truth known, scored on whether the summary kept the fact that mattered.
+
+| | GLM-5.3-Flash | DeepSeek-V4-Flash |
+|---|---|---|
+| Facts kept | **10/10** | 7/10 |
+| Invented connections | 0 | 0 |
+| Tokens per call | ~510 | ~44 |
+| Latency | 4.9 s | 0.9 s |
+
+What DeepSeek dropped is the interesting part. It lost the number `266` from "273 attempts, 266 failures, 5 successes" and then wrote a summary that contradicted itself — *"273 restart attempts yielded 5 successes, all failing"*. It recorded that a scheduled task "failed with Access denied" but not that the S4U principal was the thing that failed, so the searchable term is gone. And on the session that cost two hours to understand it said the watchdog "treats that as a crash" without recording that the shutdown was **by design** — which was the entire finding.
+
+Latency does not matter here: generation runs in the background `Stop` hook, nothing waits on it.
+
+### Thinking models need the native endpoint
+
+GLM will not work through the obvious path. Ollama's OpenAI-compatible `/v1/chat/completions` cannot accept the `think` parameter ([ollama#15288](https://github.com/ollama/ollama/issues/15288), [#15293](https://github.com/ollama/ollama/issues/15293)), so a reasoning model narrates into `content` — 1300–1600 characters of *"The user wants me to compress…"* and never the requested format, in six attempts — or, with `reasoning.enabled:false`, returns `content` empty.
+
+The proxy solves it by translating to the native `/api/chat`. Three details decide whether that works:
+
+- **`think: true`, not `false`.** Counter-intuitive: `true` puts deliberation in its own `thinking` field and leaves `content` for the answer. `false` merely inlines the same narration back into `content`.
+- **Budget headroom** (`CMP_THINK_HEADROOM`, default 1200). The caller's `max_tokens` budgets the *answer*, but the model spends tokens thinking first. Without headroom it dies mid-deliberation every time — the reason the naive attempt looked like the model was simply broken.
+- **A fallback** (`CMP_THINK_FALLBACK`, default `deepseek-v4-flash:0731`). A thinking model drains a usage quota faster, so it is first to be refused. On any 4xx/5xx the proxy retries with the cheap model: worst case is a weaker summary, never a missing one.
+
+Selection is `CMP_THINK_MODELS` (default `glm-*`), so this opens every thinking model Ollama offers. A healthy log line looks like:
+
+```
+POST /v1/chat/completions -> 200 [native think] [thoughts dropped: 1349 ch]
+```
+
+### What it actually costs
+
+Nothing, on a subscription — and "tokens" is the wrong unit to reason in.
+
+Ollama Cloud exposes an **undocumented usage endpoint** that settles this with real numbers instead of estimates:
+
+```bash
+curl -H "Authorization: Bearer $OLLAMA_API_KEY" https://ollama.com/api/usage
+```
+
+It returns `limits.session` and `limits.weekly` as 0–1 fractions plus per-model request counts, and `activity` for the last four weeks. `POST /api/me` (POST, not GET) returns the plan.
+
+On the machine this repo documents — Pro plan, memory running continuously for two weeks:
+
+| | |
+|---|---|
+| Metered cost, 4 weeks | **$0.00000** |
+| Weekly quota used | **0.5%** |
+| Projected on GLM (~2× drain) | ~1% |
+
+Two things that make token-counting misleading here. Quota is weighted **per model, not per token** — in a controlled comparison GLM drained roughly 2× the quota per call while spending *fewer* tokens than DeepSeek. And the meter ignores small requests entirely: the weekly counter showed 271 requests where the proxy log had thousands.
+
+So on a subscription, pick on quality. Token arithmetic only starts to matter on a per-token provider, or if `/api/usage` shows the weekly fraction actually climbing.
 
 ## Two weeks in
 

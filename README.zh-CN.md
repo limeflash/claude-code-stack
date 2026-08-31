@@ -27,6 +27,7 @@
 - [工具栈](#工具栈) · [它们如何协作](#它们如何协作) · [为什么需要两个代码工具](#为什么需要两个代码工具)
 - [安装](#安装) · [验证](#验证)
 - [**可直接粘贴的提示词**](#可直接粘贴的提示词) ← 装完从这里开始
+- [**如何选择模型**](#如何选择模型) —— 实测而非猜测
 - [**两周之后**](#两周之后) —— 它实际做了什么
 - [坑](#坑) · [成本与占用](#成本与占用) · [隐私](#隐私)
 
@@ -224,7 +225,8 @@ node watchdog/harden-hooks.js ~/.claude/plugins/cache/thedotmack/claude-mem/<版
 **用 [`run-hidden.vbs`](watchdog/run-hidden.vbs) 启动它，不要直接运行。** 计划任务在交互式会话里运行控制台程序，每次都会闪一个窗口。每五分钟一次，盖在你正在做的任何事情上面 —— 包括全屏游戏，会把你从里面拽出来。`wscript` 自己没有控制台，而 `Run(..., 0, False)` 会隐藏地启动子进程：
 
 ```powershell
-$vbs = "$env:USERPROFILE\.claude-mem-watchdogun-hidden.vbs"
+$vbs = "$env:USERPROFILE\.claude-mem-watchdog
+un-hidden.vbs"
 $a = New-ScheduledTaskAction -Execute wscript.exe -Argument "//nologo `"$vbs`""
 Set-ScheduledTask -TaskName claude-mem-watchdog -Action $a
 ```
@@ -258,6 +260,61 @@ Register-ScheduledTask -TaskName claude-mem-watchdog -Action $a -Trigger $t
 ```
 
 **当端口属主 PID 已不存在时**，句柄是被某个比 worker 活得更久的子进程继承了。实测中那个子进程正是 claude-mem 自己的 Chroma 栈 —— `chroma-mcp.exe` 及其 python worker，在 worker 死后被遗弃 —— **而不是**编辑器会话。看门狗会杀掉它们，然后用真正的 bind 测试证明端口确实被收回，再重启 worker；`netstat` 里的 `LISTENING` 行两个方向都不能作为证据。若仍有它无法识别的进程占着端口，它会记录下来并停手，而不是乱杀一气。
+
+## 如何选择模型
+
+记忆的质量上限就是写下它的那个模型，所以这件事是实测的，不是猜的：取本机八段真实会话（正确答案已知），只看摘要有没有留住那个关键事实。
+
+| | GLM-5.3-Flash | DeepSeek-V4-Flash |
+|---|---|---|
+| 保住的事实 | **10/10** | 7/10 |
+| 编造的关联 | 0 | 0 |
+| 每次调用 token | ~510 | ~44 |
+| 延迟 | 4.9 秒 | 0.9 秒 |
+
+更值得看的是 DeepSeek 丢了什么。它把「273 次尝试、266 次失败、5 次成功」里的 `266` 丢了，然后写出自相矛盾的一句：*「273 次重启尝试换来 5 次成功，全部失败」*。它记下计划任务「以 Access denied 失败」，却没记下失败的是 S4U 主体——可检索的关键词就此消失。而在那段花了两小时才弄清的会话里，它只说看门狗「把它当成崩溃」，没有记下那次关闭是**设计如此**——而这正是全部结论所在。
+
+延迟在这里无关紧要：生成跑在后台 `Stop` 钩子里，没有人在等它。
+
+### 思考型模型必须走原生端点
+
+GLM 走那条显而易见的路是不行的。Ollama 的 OpenAI 兼容 `/v1/chat/completions` 不接受 `think` 参数（[ollama#15288](https://github.com/ollama/ollama/issues/15288)、[#15293](https://github.com/ollama/ollama/issues/15293)），于是推理模型要么把思考直接写进 `content`——1300–1600 字的「The user wants me to compress…」，六次尝试没有一次给出要求的格式——要么在 `reasoning.enabled:false` 下返回空 `content`。
+
+代理的解法是转译到原生 `/api/chat`。能不能成，取决于三个细节：
+
+- **是 `think: true`，不是 `false`。** 反直觉：`true` 把思考放进独立的 `thinking` 字段，把 `content` 留给答案；`false` 只是把同样的絮叨塞回 `content`。
+- **预算余量**（`CMP_THINK_HEADROOM`，默认 1200）。调用方的 `max_tokens` 是给*答案*的预算，而模型要先花 token 思考。没有余量它每次都死在思考中途——正因如此，最初那次天真的尝试看上去像是模型坏了。
+- **兜底**（`CMP_THINK_FALLBACK`，默认 `deepseek-v4-flash:0731`）。思考型模型消耗配额更快，因此最先被拒。遇到任何 4xx/5xx，代理改用便宜模型重试：最坏是摘要差一点，而不是根本没有。
+
+选择范围由 `CMP_THINK_MODELS` 控制（默认 `glm-*`），因此这条路对 Ollama 的所有思考型模型都通用。健康的日志长这样：
+
+```
+POST /v1/chat/completions -> 200 [native think] [thoughts dropped: 1349 ch]
+```
+
+### 实际花多少钱
+
+订阅制下：不花钱——而且用「token」来衡量本身就选错了单位。
+
+Ollama Cloud 有一个**未公开的用量端点**，能用真实数字而非估算把这件事讲清楚：
+
+```bash
+curl -H "Authorization: Bearer $OLLAMA_API_KEY" https://ollama.com/api/usage
+```
+
+它返回以 0–1 分数表示的 `limits.session` 与 `limits.weekly`、按模型的请求计数，以及最近四周的 `activity`。`POST /api/me`（是 POST，不是 GET）返回套餐信息。
+
+在本仓库所记录的这台机器上——Pro 套餐，记忆连续运行两周：
+
+| | |
+|---|---|
+| 四周计费成本 | **$0.00000** |
+| 已用周配额 | **0.5%** |
+| 换成 GLM 的预估（约 2× 消耗） | ~1% |
+
+有两点让数 token 变得具有误导性。配额是**按模型加权，而不是按 token 计**——在一次对照测试中，GLM 每次调用消耗约两倍配额，花掉的 token 却比 DeepSeek *更少*。而且计量器完全忽略小请求：周计数器显示 271 次请求，代理日志里却是数千次。
+
+所以在订阅制下，按质量选。只有在按 token 计费的供应商那里，或者当 `/api/usage` 显示周配额确实在上涨时，token 的算术才开始有意义。
 
 ## 两周之后
 
