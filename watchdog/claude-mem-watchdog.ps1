@@ -127,9 +127,20 @@ try {
 } catch { }
 if ($workerOk) { exit 0 }
 
-Write-Log "claude-mem worker unhealthy on :$WorkerPort"
+# An absent worker is NOT a fault. claude-mem shuts its generator down after
+# about three minutes of inactivity -- "Idle timeout reached, triggering abort
+# to kill subprocess" -- and a hook lazy-spawns it again on the next prompt.
+# Treating that as breakage had this script fight the plugin's own design 273
+# times in two weeks: 266 of those "repairs" failed because there was nothing
+# to repair, and each attempt flashed a console window every five minutes.
+#
+# The real failure -- the one this script exists for -- looks different: the
+# port is BOUND but nothing answers on it. Only that case is actionable.
+if (-not (Test-Port $WorkerPort)) { exit 0 }
 
-if (Test-Port $WorkerPort) {
+Write-Log "claude-mem worker holds :$WorkerPort but does not answer"
+
+if ($true) {
     $owner = (Get-NetTCPConnection -LocalPort $WorkerPort -State Listen | Select-Object -First 1).OwningProcess
     $proc  = Get-Process -Id $owner -ErrorAction SilentlyContinue
 

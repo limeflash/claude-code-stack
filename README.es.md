@@ -27,6 +27,7 @@ Cuatro herramientas que le dan a Claude Code memoria capaz de sobrevivir a una s
 - [El stack](#el-stack) · [Cómo encaja todo](#cómo-encaja-todo) · [Por qué dos herramientas de código](#por-qué-dos-herramientas-de-código)
 - [Instalación](#instalación) · [Verificación](#verificación)
 - [**Prompts para pegar**](#prompts-para-pegar) ← empieza aquí tras instalar
+- [**Dos semanas después**](#dos-semanas-después) — lo que realmente hizo
 - [Tropiezos](#tropiezos) · [Coste y consumo](#coste-y-consumo) · [Privacidad](#privacidad)
 
 ## El stack
@@ -221,9 +222,21 @@ node watchdog/harden-hooks.js ~/.claude/plugins/cache/thedotmack/claude-mem/<ver
 
 Un `exit 1` dentro del comando original ahora solo termina la subshell, y el `exit 0` final se ejecuta igual — así que un worker muerto te cuesta unas cuantas observaciones, no la capacidad de escribir. Es idempotente; repítelo tras actualizar el plugin, porque la caché se sobrescribe.
 
-**2. Watchdog — la recuperación.** [`claude-mem-watchdog.ps1`](watchdog/claude-mem-watchdog.ps1) como tarea programada, cada 5 minutos: sondea `:37777` y, si no está sano, mata el worker colgado y lo relanza. También comprueba el proxy de Ollama en `:11435` — ese corre en una ventana de consola, así que un Ctrl+C accidental lo mata y a partir de ahí el worker sigue reportándose sano mientras cada petición de generación falla en silencio.
+**2. Watchdog — la recuperación.** [`claude-mem-watchdog.ps1`](watchdog/claude-mem-watchdog.ps1) como tarea programada, cada 5 minutos. Relanza el proxy de Ollama en `:11435` cuando se cae: ese corre en una ventana de consola, así que un Ctrl+C accidental lo mata y a partir de ahí el worker sigue reportándose sano mientras cada petición de generación falla en silencio.
 
-Sale de inmediato si no hay ningún cliente de agente corriendo, y otra vez si desactivaste el plugin: sin cliente no hay consumidor, y un plugin desactivado es una decisión, no un fallo. Mantiene un mutex global para que una ejecución manual y la programada nunca se solapen: dos copias llegaron a pelearse y una mató el daemon sano que la otra acababa de levantar.
+Sobre el worker actúa bajo **una sola** condición: `:37777` está **ocupado pero nadie responde**. Ese es el bloqueo real. A un worker que sencillamente no está no lo toca, porque claude-mem apaga su generador tras unos 3 minutos de inactividad (`Idle timeout reached, triggering abort to kill subprocess`) y un hook lo relanza en el siguiente prompt. Equivocarse aquí sale caro — ver [Dos semanas después](#dos-semanas-después).
+
+Sale de inmediato si no hay ningún cliente de agente corriendo, y también si desactivaste el plugin: sin cliente no hay consumidor, y un plugin desactivado es una decisión, no un fallo. Un mutex global cubre por igual las ejecuciones programadas y las manuales: dos copias llegaron a pelearse y una mató el demonio sano que la otra acababa de levantar.
+
+**Lánzalo mediante [`run-hidden.vbs`](watchdog/run-hidden.vbs), no directamente.** El Programador de tareas, al ejecutar una aplicación de consola en una sesión interactiva, hace parpadear una ventana en cada ejecución. Cada cinco minutos, encima de lo que estés haciendo — incluidos juegos a pantalla completa, de los que te saca. `wscript` no tiene consola propia y `Run(..., 0, False)` arranca el hijo oculto:
+
+```powershell
+$vbs = "$env:USERPROFILE\.claude-mem-watchdogun-hidden.vbs"
+$a = New-ScheduledTaskAction -Execute wscript.exe -Argument "//nologo `"$vbs`""
+Set-ScheduledTask -TaskName claude-mem-watchdog -Action $a
+```
+
+`-WindowStyle Hidden` por sí solo no basta, y la solución limpia — un principal S4U que nunca toca el escritorio — requiere permisos de administrador.
 
 ## Mantener vivo el grafo de código
 
@@ -252,6 +265,34 @@ Register-ScheduledTask -TaskName claude-mem-watchdog -Action $a -Trigger $t
 ```
 
 **Cuando el PID dueño del puerto está muerto**, el descriptor lo heredó un hijo que sobrevivió al worker. En la práctica ese hijo es el propio stack Chroma de claude-mem — `chroma-mcp.exe` y sus workers de python — huérfanos desde que murió el worker, y **no** una sesión del editor. El watchdog mata esos, y luego demuestra que el puerto quedó realmente libre con un bind de verdad antes de relanzar; una línea `LISTENING` en `netstat` no prueba nada en ninguna dirección. Si algo que no puede identificar sigue ocupando el puerto, lo registra y se detiene en vez de matar procesos al azar.
+
+## Dos semanas después
+
+Cifras de una máquina con este stack funcionando de forma continua, del 17 al 31 de agosto de 2026:
+
+| | |
+|---|---|
+| Base de datos de memoria | 5,5 MB → **51,9 MB** |
+| Observaciones registradas | ~7.900 |
+| Llamadas de generación por el proxy | 7.383, de las cuales **2** no fueron `200` |
+| **Credenciales eliminadas antes de salir de la máquina** | **4.192** |
+| Proxy muerto por un Ctrl+C accidental | 2 — el watchdog relanzó ambos |
+| Bloqueos por socket huérfano resueltos | 4 |
+
+**Esos 4.192 son todo el argumento a favor del proxy.** Cada uno era una contraseña, un token o una cadena basic-auth dentro de una conversación que estaba a punto de enviarse literalmente a un modelo de terceros para resumirla. El proxy los sustituyó por `[SECRET:{type}]` antes de enviarla.
+
+**Calidad del recuerdo.** Sobre trabajo de hace minutos responde con precisión y concreción — ya había registrado «cambio del principal de la tarea a S4U bloqueado por acceso denegado» y «ventana de powershell ajena identificada como el proceso del terminal Warp» mientras ese trabajo aún ocurría. Pedirle un incidente concreto de hace dos semanas devolvió material vecino en lugar del evento exacto. El recuerdo reciente es fuerte; la puntería a largo plazo es más débil: trátalo como memoria de trabajo, no como un archivo consultable como una base de datos.
+
+**Y en qué se equivocó el watchdog.** Leer un reposo sano como avería sale caro:
+
+```
+273  claude-mem worker unhealthy on :37777
+273    respawning worker from 13.15.0
+266    worker still down after 45s      <- no había nada roto
+  5    worker recovered
+```
+
+Un intento de reparación inútil cada cinco minutos durante dos semanas, cada uno haciendo parpadear una consola sobre lo que hubiera en pantalla, juegos a pantalla completa incluidos. El worker nunca estuvo roto: claude-mem simplemente apaga su generador al quedar inactivo. Las dos correcciones (actuar solo ante «ocupado pero sin respuesta» y lanzar vía `wscript`) están en este repositorio.
 
 ## Tropiezos
 

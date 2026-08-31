@@ -27,6 +27,7 @@ Four tools that give Claude Code memory surviving across sessions and a structur
 - [The stack](#the-stack) · [How it fits together](#how-it-fits-together) · [Why two code tools](#why-two-code-tools)
 - [Install](#install) · [Verify](#verify)
 - [**Prompts to paste**](#prompts-to-paste) ← start here after installing
+- [**Two weeks in**](#two-weeks-in) — what it actually did
 - [Gotchas](#gotchas) · [Cost and footprint](#cost-and-footprint) · [Privacy](#privacy)
 
 ## The stack
@@ -216,9 +217,22 @@ node watchdog/harden-hooks.js ~/.claude/plugins/cache/thedotmack/claude-mem/<ver
 
 An `exit 1` inside the original command now terminates only the subshell, and the trailing `exit 0` still runs — so a dead worker costs you some observations instead of your ability to type. Idempotent; re-apply after a plugin update, since the plugin cache is overwritten.
 
-**2. Watchdog — the recovery.** [`claude-mem-watchdog.ps1`](watchdog/claude-mem-watchdog.ps1) as a scheduled task, every 5 minutes: probes `:37777`, and if it is unhealthy kills the hung worker and respawns it. It also checks the Ollama proxy on `:11435` — that one runs in a console window, so a stray Ctrl+C kills it, after which the worker still reports healthy while every generation request quietly fails.
+**2. Watchdog — the recovery.** [`claude-mem-watchdog.ps1`](watchdog/claude-mem-watchdog.ps1) as a scheduled task, every 5 minutes. It restarts the Ollama proxy on `:11435` when that is down — the proxy runs in a console window, so a stray Ctrl+C kills it, after which the worker still reports healthy while every generation request quietly fails.
 
-It exits immediately when no agent client is running, and again if you disabled the plugin — no client means no consumer, and a disabled plugin is a decision, not a fault. It holds a global mutex so a manual run and the scheduled one can never overlap: two copies once fought and one killed the healthy daemon the other had just started.
+For the worker it acts on **one** condition only: `:37777` is **bound but nothing answers**. That is the real deadlock. A worker that is simply absent is left alone, because claude-mem shuts its generator down after ~3 minutes idle (`Idle timeout reached, triggering abort to kill subprocess`) and a hook lazy-spawns it on the next prompt. Getting this wrong is expensive — see [Two weeks in](#two-weeks-in).
+
+It exits immediately when no agent client is running, and again if you disabled the plugin — no client means no consumer, and a disabled plugin is a decision, not a fault. A global mutex covers scheduled and manual runs alike: two copies once fought and one killed the healthy daemon the other had just started.
+
+**Launch it through [`run-hidden.vbs`](watchdog/run-hidden.vbs), not directly.** Task Scheduler running a console app in an interactive session flashes a window on every run. Every five minutes, on top of whatever you are doing — including full-screen games, which it pulls you out of. `wscript` has no console of its own and `Run(..., 0, False)` starts the child hidden:
+
+```powershell
+$vbs = "$env:USERPROFILE\.claude-mem-watchdog
+un-hidden.vbs"
+$a = New-ScheduledTaskAction -Execute wscript.exe -Argument "//nologo `"$vbs`""
+Set-ScheduledTask -TaskName claude-mem-watchdog -Action $a
+```
+
+`-WindowStyle Hidden` alone does not do it, and the clean fix — an S4U principal that never touches the desktop — needs admin rights.
 
 ## Keeping the code graph alive
 
@@ -247,6 +261,34 @@ Register-ScheduledTask -TaskName claude-mem-watchdog -Action $a -Trigger $t
 ```
 
 **When the port owner PID is dead**, the handle was inherited by a child that outlived the worker. In practice that child is claude-mem's own Chroma stack — `chroma-mcp.exe` and its python workers — orphaned when the worker died, *not* an editor session. The watchdog kills those, then proves the port is genuinely reclaimed with a bind test before respawning; a `LISTENING` row in `netstat` is not proof either way. If something it cannot identify still holds the port, it logs that and stops rather than killing processes at random.
+
+## Two weeks in
+
+Numbers from one machine running this stack continuously, 17–31 August 2026:
+
+| | |
+|---|---|
+| Memory database | 5.5 MB → **51.9 MB** |
+| Observations recorded | ~7,900 |
+| Generation calls through the proxy | 7,383, of which **2** were not `200` |
+| **Credentials stripped before leaving the machine** | **4,192** |
+| Proxy killed by a stray Ctrl+C | 2 — the watchdog restarted both |
+| Orphaned-socket deadlocks cleared | 4 |
+
+**That 4,192 is the whole argument for the proxy.** Every one of those was a password, token or basic-auth string sitting in a conversation that was about to be sent verbatim to a third-party model for summarising. The proxy replaced each with `[SECRET:{type}]` first.
+
+**Recall quality.** Asked about work from minutes earlier, it is precise and specific — it had already recorded "scheduled task principal change to S4U blocked by access denied" and "foreign powershell window identified as Warp terminal's process" while that work was still happening. Asked to pin down one specific incident from two weeks back, it returned neighbouring material instead of the exact event. Recent recall is strong; long-range pinpointing is weaker, so treat it as a working memory, not an archive you can query like a database.
+
+**And what the watchdog got wrong.** Misreading a healthy idle state as a fault is expensive:
+
+```
+273  claude-mem worker unhealthy on :37777
+273    respawning worker from 13.15.0
+266    worker still down after 45s      <- nothing was broken
+  5    worker recovered
+```
+
+One pointless repair attempt every five minutes for two weeks, each flashing a console window over whatever was on screen — full-screen games included. The worker was never broken; claude-mem simply shuts its generator down when idle. Both fixes (act only on bound-but-unresponsive, launch through `wscript`) are in this repo.
 
 ## Gotchas
 
