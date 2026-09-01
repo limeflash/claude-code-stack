@@ -96,7 +96,7 @@ cd claude-mem-ollama-proxy
 .\windows\install.ps1
 ```
 
-macOS/Linux: `./macos/install.sh`. Registers an at-logon task (no admin), points claude-mem at `http://127.0.0.1:11435/v1`, defaults to `deepseek-v4-flash:0731`. Another model: `-Model "gpt-oss:120b"` — list them at `https://ollama.com/v1/models`.
+macOS/Linux: `./macos/install.sh`. Registers an at-logon task (no admin), points claude-mem at `http://127.0.0.1:11435/v1`, defaults to `glm-5.3-flash`. Another model: `-Model "gpt-oss:120b"` — list them at `https://ollama.com/v1/models`.
 
 It injects `reasoning_effort: "none"`. Without that a reasoning model returns its answer in `reasoning`, leaves `content` empty, and claude-mem silently stores nothing. For models that ignore that flag entirely, see [Choosing the model](#choosing-the-model) — the proxy routes them through Ollama's native endpoint instead.
 

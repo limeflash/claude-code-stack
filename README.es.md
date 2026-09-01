@@ -96,7 +96,7 @@ cd claude-mem-ollama-proxy
 .\windows\install.ps1
 ```
 
-En macOS/Linux: `./macos/install.sh`. Registra una tarea al iniciar sesión (sin permisos de administrador), apunta claude-mem a `http://127.0.0.1:11435/v1` y usa `deepseek-v4-flash:0731` por defecto. Otro modelo: `-Model "gpt-oss:120b"` — lista en `https://ollama.com/v1/models`.
+En macOS/Linux: `./macos/install.sh`. Registra una tarea al iniciar sesión (sin permisos de administrador), apunta claude-mem a `http://127.0.0.1:11435/v1` y usa `glm-5.3-flash` por defecto. Otro modelo: `-Model "gpt-oss:120b"` — lista en `https://ollama.com/v1/models`.
 
 Inyecta `reasoning_effort: "none"`. Sin eso, un modelo de razonamiento devuelve la respuesta en `reasoning`, deja `content` vacío y claude-mem no guarda nada sin avisar.
 

@@ -96,7 +96,7 @@ cd claude-mem-ollama-proxy
 .\windows\install.ps1
 ```
 
-macOS/Linux 用 `./macos/install.sh`。注册登录时启动的计划任务（无需管理员），把 claude-mem 指向 `http://127.0.0.1:11435/v1`，默认模型 `deepseek-v4-flash:0731`。换模型：`-Model "gpt-oss:120b"` —— 列表见 `https://ollama.com/v1/models`。
+macOS/Linux 用 `./macos/install.sh`。注册登录时启动的计划任务（无需管理员），把 claude-mem 指向 `http://127.0.0.1:11435/v1`，默认模型 `glm-5.3-flash`。换模型：`-Model "gpt-oss:120b"` —— 列表见 `https://ollama.com/v1/models`。
 
 它会注入 `reasoning_effort: "none"`。否则 reasoning 模型会把答案放进 `reasoning`、让 `content` 为空，claude-mem 便悄无声息地什么都没存。
 

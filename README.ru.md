@@ -96,7 +96,7 @@ cd claude-mem-ollama-proxy
 .\windows\install.ps1
 ```
 
-macOS/Linux: `./macos/install.sh`. Регистрирует задачу на вход в систему (без прав администратора), направляет claude-mem на `http://127.0.0.1:11435/v1`, модель по умолчанию `deepseek-v4-flash:0731`. Другая модель: `-Model "gpt-oss:120b"` — список на `https://ollama.com/v1/models`.
+macOS/Linux: `./macos/install.sh`. Регистрирует задачу на вход в систему (без прав администратора), направляет claude-mem на `http://127.0.0.1:11435/v1`, модель по умолчанию `glm-5.3-flash`. Другая модель: `-Model "gpt-oss:120b"` — список на `https://ollama.com/v1/models`.
 
 Прокси подставляет `reasoning_effort: "none"`. Без этого reasoning-модель кладёт ответ в `reasoning`, оставляет `content` пустым, и claude-mem молча не сохраняет ничего. Для моделей, которые игнорируют этот флаг, см. [Как выбрать модель](#как-выбрать-модель) — их прокси уводит на нативный эндпоинт Ollama.
 
