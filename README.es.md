@@ -96,7 +96,7 @@ cd claude-mem-ollama-proxy
 .\windows\install.ps1
 ```
 
-En macOS/Linux: `./macos/install.sh`. Registra una tarea al iniciar sesión (sin permisos de administrador), apunta claude-mem a `http://127.0.0.1:11435/v1` y usa `glm-5.3-flash` por defecto. Otro modelo: `-Model "gpt-oss:120b"` — lista en `https://ollama.com/v1/models`.
+En macOS/Linux: `./macos/install.sh`. Registra una tarea al iniciar sesión (sin permisos de administrador), apunta claude-mem a `http://127.0.0.1:11435/v1` y usa `deepseek-v4.1-flash` por defecto. Otro modelo: `-Model "gpt-oss:120b"` — lista en `https://ollama.com/v1/models`.
 
 Inyecta `reasoning_effort: "none"`. Sin eso, un modelo de razonamiento devuelve la respuesta en `reasoning`, deja `content` vacío y claude-mem no guarda nada sin avisar.
 
@@ -270,58 +270,45 @@ Register-ScheduledTask -TaskName claude-mem-watchdog -Action $a -Trigger $t
 
 ## Cómo elegir el modelo
 
-La memoria vale lo que valga el modelo que la escribe, así que esto se midió en vez de suponerse: ocho sesiones reales de esta máquina, con la respuesta correcta conocida, puntuadas según si el resumen conservó el hecho que importaba.
+**Usa `deepseek-v4.1-flash`.** Se midió, no se supuso: ocho sesiones reales de esta máquina con la respuesta correcta conocida, puntuadas según si el resumen conservó el hecho que importaba.
 
-| | GLM-5.3-Flash | DeepSeek-V4-Flash |
-|---|---|---|
-| Hechos conservados | **10/10** | 7/10 |
-| Conexiones inventadas | 0 | 0 |
-| Tokens por llamada | ~510 | ~44 |
-| Latencia | 4,9 s | 0,9 s |
+| | **deepseek-v4.1-flash** | glm-5.3-flash | deepseek-v4-flash:0731 (retirado) |
+|---|---|---|---|
+| Hechos conservados | **10/10** | 10/10 | 7/10 |
+| Tokens por llamada | **~62** | ~480 | ~44 |
+| Latencia | **0,6 s** | 5,2 s | 0,9 s |
+| Cuota de sesión por llamada | **< 0,007%** | ~0,020% | — |
 
-Lo interesante es qué perdió DeepSeek. Se dejó el número `266` de «273 intentos, 266 fallos, 5 éxitos» y escribió un resumen que se contradice a sí mismo: *«273 intentos de reinicio dieron 5 éxitos, todos fallando»*. Registró que una tarea programada «falló con Access denied», pero no que lo que falló fue el principal S4U, así que el término buscable desaparece. Y en la sesión que costó dos horas entender, dijo que el watchdog «lo toma por un cuelgue» sin registrar que el apagado era **por diseño**, que era justamente todo el hallazgo.
-
-La latencia aquí da igual: la generación corre en el hook `Stop` en segundo plano y nadie la espera.
+El `0731` retirado perdía el número `266` de «273 intentos, 266 fallos, 5 éxitos» y se contradecía, y en la sesión que costó dos horas entender omitió que el apagado era **por diseño**, que era todo el hallazgo. `glm-5.3-flash` lo corrigió, por eso fue la recomendación durante un tiempo. `deepseek-v4.1-flash` conserva los mismos hechos que GLM con una octava parte de tokens y latencia y como mucho un tercio de la cuota; leído a mano es incluso más limpio: GLM se inventó «on locked dirs» en un resumen. La latencia apenas importa (la generación corre en el hook `Stop` en segundo plano); la cuota sí, ver abajo.
 
 ### Los modelos que razonan necesitan el endpoint nativo
 
-Por el camino obvio GLM no funciona. El `/v1/chat/completions` compatible con OpenAI de Ollama no acepta el parámetro `think` ([ollama#15288](https://github.com/ollama/ollama/issues/15288), [#15293](https://github.com/ollama/ollama/issues/15293)), así que un modelo de razonamiento narra dentro de `content` —1300–1600 caracteres de «The user wants me to compress…», sin dar ni una vez el formato pedido en seis intentos— o, con `reasoning.enabled:false`, devuelve `content` vacío.
+Si aun así usas un modelo que piensa en voz alta (GLM y similares), el camino obvio falla. El `/v1/chat/completions` compatible con OpenAI de Ollama no acepta el parámetro `think` ([ollama#15288](https://github.com/ollama/ollama/issues/15288), [#15293](https://github.com/ollama/ollama/issues/15293)), así que el modelo o narra dentro de `content` —1300–1600 caracteres de «The user wants me to compress…»— o devuelve `content` vacío. El proxy enruta esos modelos (`CMP_THINK_MODELS`, por defecto `glm-*`) por el `/api/chat` nativo. Tres detalles deciden si funciona:
 
-El proxy lo resuelve traduciendo al `/api/chat` nativo. Tres detalles deciden si eso funciona:
+- **`think: true`, no `false`.** `true` pone la deliberación en su propio campo `thinking` y deja `content` para la respuesta; `false` reinserta la cháchara en `content`.
+- **Margen de presupuesto** (`CMP_THINK_HEADROOM`, por defecto 1200). El `max_tokens` de quien llama presupuesta la respuesta; sin margen para el razonamiento oculto el modelo muere a mitad cada vez.
+- **Un plan B** (`CMP_THINK_FALLBACK`, por defecto `deepseek-v4.1-flash`) ante cualquier 4xx/5xx, para que un rechazo empeore el resumen en vez de perderlo. Mantenlo apuntando a un modelo que exista: el valor por defecto de este repo era `deepseek-v4-flash:0731` hasta que Ollama lo retiró y cada plan B respondía 410.
 
-- **`think: true`, no `false`.** Contraintuitivo: `true` coloca la deliberación en su propio campo `thinking` y deja `content` para la respuesta; `false` se limita a reinsertar la misma cháchara en `content`.
-- **Margen de presupuesto** (`CMP_THINK_HEADROOM`, por defecto 1200). El `max_tokens` de quien llama presupuesta la *respuesta*, pero el modelo gasta tokens pensando primero. Sin margen muere a mitad de la deliberación siempre — por eso el intento ingenuo parecía que el modelo estaba roto.
-- **Un plan B** (`CMP_THINK_FALLBACK`, por defecto `deepseek-v4-flash:0731`). Un modelo que razona agota la cuota más rápido, así que es el primero al que se le niega el servicio. Ante cualquier 4xx/5xx el proxy reintenta con el modelo barato: lo peor es un resumen más flojo, nunca uno ausente.
+### Cuánto cuesta en realidad, y en qué se equivocó este repo
 
-La selección es `CMP_THINK_MODELS` (por defecto `glm-*`), así que esto abre todos los modelos con razonamiento de Ollama. Una línea de log sana:
-
-```
-POST /v1/chat/completions -> 200 [native think] [thoughts dropped: 1349 ch]
-```
-
-### Cuánto cuesta en realidad
-
-En una suscripción, nada — y «tokens» es la unidad equivocada para razonar aquí.
-
-Ollama Cloud expone un **endpoint de uso no documentado** que zanja el asunto con números reales en vez de estimaciones:
+Ollama Cloud es una suscripción: los tokens no son dinero (el coste medido aquí fue $0.00000). Lo que se agota es la **cuota**: un límite de sesión de 5 horas y uno semanal, ponderados por modelo y no por token, compartidos por todos los modelos de la cuenta. Consúltala con el endpoint no documentado:
 
 ```bash
 curl -H "Authorization: Bearer $OLLAMA_API_KEY" https://ollama.com/api/usage
 ```
 
-Devuelve `limits.session` y `limits.weekly` como fracciones de 0 a 1, más recuentos de peticiones por modelo, y `activity` de las últimas cuatro semanas. `POST /api/me` (POST, no GET) devuelve el plan.
+Devuelve `limits.session` / `limits.weekly` como fracciones de 0 a 1 y recuentos por modelo; `POST /api/me` devuelve el plan.
 
-En la máquina que documenta este repositorio — plan Pro, memoria funcionando de continuo durante dos semanas:
+Una versión anterior de esta sección leyó un 0,5% de uso semanal y prometió «~1% con GLM, unas 100× de margen». **Era falso.** La lectura se tomó justo después de reiniciarse la ventana semanal —el contador marcaba solo 271 peticiones— y se extrapoló desde ahí. Una semana con GLM produjo 4.386 peticiones de GLM y 1.990 de otros, y la cuota semanal llegó al **100%**:
 
-| | |
-|---|---|
-| Coste medido, 4 semanas | **$0.00000** |
-| Cuota semanal consumida | **0,5%** |
-| Proyección con GLM (~2× de consumo) | ~1% |
+```
+          200     429 (cuota)   410 (modelo retirado)
+09-19     863        6.876            0
+09-24     207       26.109            0
+09-25       1       21.142        6.427
+```
 
-Dos cosas hacen engañoso contar tokens. La cuota se pondera **por modelo, no por token**: en una comparación controlada GLM consumió unas 2× de cuota por llamada gastando *menos* tokens que DeepSeek. Y el medidor ignora por completo las peticiones pequeñas: el contador semanal marcaba 271 peticiones donde el log del proxy tenía miles.
-
-Así que con una suscripción, elige por calidad. La aritmética de tokens solo empieza a importar con un proveedor que cobre por token, o si `/api/usage` muestra que la fracción semanal sube de verdad.
+Como la cuota es de toda la cuenta, todos los modelos respondieron 429 a la vez, el plan B no sirvió de nada, y claude-mem siguió reintentando —hasta 26.000 llamadas rechazadas al día— mientras la memoria dejó de escribirse casi una semana. Dos lecciones: **lee `/api/usage` al final de la semana, nunca justo después de un reinicio**, y en una suscripción el peso del modelo que razona en la cuota importa mucho más que sus tokens.
 
 ## Dos semanas después
 

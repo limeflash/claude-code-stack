@@ -96,7 +96,7 @@ cd claude-mem-ollama-proxy
 .\windows\install.ps1
 ```
 
-macOS/Linux 用 `./macos/install.sh`。注册登录时启动的计划任务（无需管理员），把 claude-mem 指向 `http://127.0.0.1:11435/v1`，默认模型 `glm-5.3-flash`。换模型：`-Model "gpt-oss:120b"` —— 列表见 `https://ollama.com/v1/models`。
+macOS/Linux 用 `./macos/install.sh`。注册登录时启动的计划任务（无需管理员），把 claude-mem 指向 `http://127.0.0.1:11435/v1`，默认模型 `deepseek-v4.1-flash`。换模型：`-Model "gpt-oss:120b"` —— 列表见 `https://ollama.com/v1/models`。
 
 它会注入 `reasoning_effort: "none"`。否则 reasoning 模型会把答案放进 `reasoning`、让 `content` 为空，claude-mem 便悄无声息地什么都没存。
 
@@ -263,58 +263,45 @@ Register-ScheduledTask -TaskName claude-mem-watchdog -Action $a -Trigger $t
 
 ## 如何选择模型
 
-记忆的质量上限就是写下它的那个模型，所以这件事是实测的，不是猜的：取本机八段真实会话（正确答案已知），只看摘要有没有留住那个关键事实。
+**用 `deepseek-v4.1-flash`。** 这是实测而非猜测：取本机八段真实会话（正确答案已知），只看摘要有没有留住关键事实。
 
-| | GLM-5.3-Flash | DeepSeek-V4-Flash |
-|---|---|---|
-| 保住的事实 | **10/10** | 7/10 |
-| 编造的关联 | 0 | 0 |
-| 每次调用 token | ~510 | ~44 |
-| 延迟 | 4.9 秒 | 0.9 秒 |
+| | **deepseek-v4.1-flash** | glm-5.3-flash | deepseek-v4-flash:0731（已下线） |
+|---|---|---|---|
+| 保住的事实 | **10/10** | 10/10 | 7/10 |
+| 每次调用 token | **~62** | ~480 | ~44 |
+| 延迟 | **0.6 秒** | 5.2 秒 | 0.9 秒 |
+| 每次调用消耗的会话配额 | **< 0.007%** | ~0.020% | — |
 
-更值得看的是 DeepSeek 丢了什么。它把「273 次尝试、266 次失败、5 次成功」里的 `266` 丢了，然后写出自相矛盾的一句：*「273 次重启尝试换来 5 次成功，全部失败」*。它记下计划任务「以 Access denied 失败」，却没记下失败的是 S4U 主体——可检索的关键词就此消失。而在那段花了两小时才弄清的会话里，它只说看门狗「把它当成崩溃」，没有记下那次关闭是**设计如此**——而这正是全部结论所在。
-
-延迟在这里无关紧要：生成跑在后台 `Stop` 钩子里，没有人在等它。
+已下线的 `0731` 把「273 次尝试、266 次失败、5 次成功」里的 `266` 丢了，还自相矛盾；在那段花了两小时才弄清的会话里，它没有记下那次关闭是**设计如此**——而这正是全部结论。`glm-5.3-flash` 修正了这一点，所以一度是推荐选项。`deepseek-v4.1-flash` 保住的事实与 GLM 相同，token 与延迟只有其八分之一，配额最多三分之一；人工阅读甚至更干净——GLM 在一条摘要里编造了「on locked dirs」。延迟几乎无关紧要（生成在后台 `Stop` 钩子里），配额才要紧——见下文。
 
 ### 思考型模型必须走原生端点
 
-GLM 走那条显而易见的路是不行的。Ollama 的 OpenAI 兼容 `/v1/chat/completions` 不接受 `think` 参数（[ollama#15288](https://github.com/ollama/ollama/issues/15288)、[#15293](https://github.com/ollama/ollama/issues/15293)），于是推理模型要么把思考直接写进 `content`——1300–1600 字的「The user wants me to compress…」，六次尝试没有一次给出要求的格式——要么在 `reasoning.enabled:false` 下返回空 `content`。
+如果仍要用会「边想边说」的模型（GLM 之类），显而易见的路走不通。Ollama 的 OpenAI 兼容 `/v1/chat/completions` 不接受 `think` 参数（[ollama#15288](https://github.com/ollama/ollama/issues/15288)、[#15293](https://github.com/ollama/ollama/issues/15293)），模型要么把思考写进 `content`——1300–1600 字的「The user wants me to compress…」——要么返回空 `content`。代理会把这类模型（`CMP_THINK_MODELS`，默认 `glm-*`）改走原生 `/api/chat`。成败取决于三个细节：
 
-代理的解法是转译到原生 `/api/chat`。能不能成，取决于三个细节：
+- **是 `think: true`，不是 `false`。** `true` 把思考放进独立的 `thinking` 字段，`content` 留给答案；`false` 只是把絮叨塞回 `content`。
+- **预算余量**（`CMP_THINK_HEADROOM`，默认 1200）。调用方的 `max_tokens` 只是答案的预算；不给隐藏思考留余量，模型每次都死在半路。
+- **兜底**（`CMP_THINK_FALLBACK`，默认 `deepseek-v4.1-flash`）：遇到任何 4xx/5xx 就换模型重试，让拒绝只降低摘要质量而不是丢掉它。务必让它指向仍然存在的模型——本仓库原先默认 `deepseek-v4-flash:0731`，Ollama 把它下线后，每次兜底都返回 410。
 
-- **是 `think: true`，不是 `false`。** 反直觉：`true` 把思考放进独立的 `thinking` 字段，把 `content` 留给答案；`false` 只是把同样的絮叨塞回 `content`。
-- **预算余量**（`CMP_THINK_HEADROOM`，默认 1200）。调用方的 `max_tokens` 是给*答案*的预算，而模型要先花 token 思考。没有余量它每次都死在思考中途——正因如此，最初那次天真的尝试看上去像是模型坏了。
-- **兜底**（`CMP_THINK_FALLBACK`，默认 `deepseek-v4-flash:0731`）。思考型模型消耗配额更快，因此最先被拒。遇到任何 4xx/5xx，代理改用便宜模型重试：最坏是摘要差一点，而不是根本没有。
+### 实际花多少——以及本仓库错在哪里
 
-选择范围由 `CMP_THINK_MODELS` 控制（默认 `glm-*`），因此这条路对 Ollama 的所有思考型模型都通用。健康的日志长这样：
-
-```
-POST /v1/chat/completions -> 200 [native think] [thoughts dropped: 1349 ch]
-```
-
-### 实际花多少钱
-
-订阅制下：不花钱——而且用「token」来衡量本身就选错了单位。
-
-Ollama Cloud 有一个**未公开的用量端点**，能用真实数字而非估算把这件事讲清楚：
+Ollama Cloud 是订阅制：token 不等于钱（这里的计费成本是 $0.00000）。真正会耗尽的是**配额**——5 小时会话限额和周限额，按模型加权而非按 token 计，并由账户下所有模型共享。用未公开的端点查看：
 
 ```bash
 curl -H "Authorization: Bearer $OLLAMA_API_KEY" https://ollama.com/api/usage
 ```
 
-它返回以 0–1 分数表示的 `limits.session` 与 `limits.weekly`、按模型的请求计数，以及最近四周的 `activity`。`POST /api/me`（是 POST，不是 GET）返回套餐信息。
+它返回 0–1 分数形式的 `limits.session` / `limits.weekly` 以及按模型的请求计数；`POST /api/me` 返回套餐。
 
-在本仓库所记录的这台机器上——Pro 套餐，记忆连续运行两周：
+本节早先的版本根据 0.5% 的周用量，承诺「用 GLM 约 1%，余量约 100 倍」。**这是错的。** 那次读数恰好在周窗口重置之后——计数器只有 271 次请求——然后据此外推。整周跑 GLM 产生了 4,386 次 GLM 请求和 1,990 次其他请求，周配额达到 **100%**：
 
-| | |
-|---|---|
-| 四周计费成本 | **$0.00000** |
-| 已用周配额 | **0.5%** |
-| 换成 GLM 的预估（约 2× 消耗） | ~1% |
+```
+          200     429（配额）   410（模型下线）
+09-19     863        6,876            0
+09-24     207       26,109            0
+09-25       1       21,142        6,427
+```
 
-有两点让数 token 变得具有误导性。配额是**按模型加权，而不是按 token 计**——在一次对照测试中，GLM 每次调用消耗约两倍配额，花掉的 token 却比 DeepSeek *更少*。而且计量器完全忽略小请求：周计数器显示 271 次请求，代理日志里却是数千次。
-
-所以在订阅制下，按质量选。只有在按 token 计费的供应商那里，或者当 `/api/usage` 显示周配额确实在上涨时，token 的算术才开始有意义。
+配额是账户级的，所有模型同时返回 429，兜底也无济于事，而 claude-mem 不停重试——每天多达 26,000 次被拒——近一周没有写入记忆。两条教训：**在周末而不是刚重置时查看 `/api/usage`**；在订阅制下，思考型模型的配额权重远比它的 token 数重要。
 
 ## 两周之后
 
