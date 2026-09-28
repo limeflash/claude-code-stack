@@ -121,11 +121,11 @@ codebase-memory-mcp cli list_projects
 ### 4 · Serena
 
 ```powershell
-uv tool install --from git+https://github.com/oraios/serena serena-agent
+uv tool install --from git+https://github.com/oraios/serena@9f9db76622340930d66aba9f72a2349b30bb1e29 serena-agent
 claude mcp add serena -s user -- serena start-mcp-server --context claude-code --project-from-cwd --enable-web-dashboard False
 ```
 
-想锁定版本，在仓库 URL 后加 `@v1.7.0`。之后升级加 `--force`；若删不掉旧的工具目录，见[坑](#坑)。
+**请保留这个固定版本。** 它是 1.x 线的最后一个提交（2026-09-06，版本号 `1.7.1.dev0`）。自 2026-09-15 起，Serena 的 `main` 是尚未发布的 `2.0.0.dev0`：其中 `activate_project` 必须传入 `session_id`，而 [`CLAUDE.md`](CLAUDE.md) 的规则不会传，应用本身也改为 GPL-3.0 许可。等 2.0 正式发布、规则相应调整后再移动固定点。重装或升级时加 `--force`；若删不掉旧的工具目录，见[坑](#坑)。
 
 ### 5 · 全局指令
 
@@ -164,8 +164,9 @@ codebase-memory-mcp cli list_projects        # UI: http://127.0.0.1:9749
 2. 遇到"X 在哪 / 谁调用 X / 这是怎么搭的 / 改了 X 会坏什么"，使用 get_architecture、search_graph、
    trace_path、query_graph、get_code_snippet。语义搜索是 search_graph 的一种模式
    （semantic_query=["a","b"]），不是独立工具。结构性问题不要退回去用 Grep/Glob。
-3. Serena 一次只持有一个项目。如果要修改的文件不在本会话的工作目录内，先调用
-   activate_project("<仓库路径>")，否则跑起来的是错误的 language server。然后用 find_referencing_symbols
+3. Serena 一次只持有一个项目。会话在某个仓库内启动时，Serena 整个会话都绑定该仓库 —— activate_project
+   被有意禁用，其他仓库的文件它无法触及。会话在任何仓库之外启动时，先调用 activate_project("<仓库路径>")
+   再做第一次查找。然后用 find_referencing_symbols
    拿到精确引用，用 replace_symbol_body / insert_after_symbol / rename_symbol / safe_delete_symbol 修改，
    最后执行 get_diagnostics_for_file。
 4. 图谱与文件不一致时以文件为准 —— 重新索引，不要相信过期答案。
@@ -345,14 +346,17 @@ curl -H "Authorization: Bearer $OLLAMA_API_KEY" https://ollama.com/api/usage
 | `daemon status` 显示 "not running"，但 :9749 的 UI 有响应 | 多个守护进程互相竞争，通常来自反复 `install --force` | `daemon stop`，杀掉残留的 `codebase-memory-mcp.exe`，再执行一次 `daemon start` |
 | **图谱 UI 里项目列表为空**，或者 `daemon status` 报 "not running" 而 `codebase-memory-mcp.exe` 明明活着并在服务 `:9749` | 守护进程是从管道名哈希与 CLI 不一致的上下文启动的 —— 通常是计划任务。它在运行却永远找不到，于是每条 CLI 命令都另起一次性守护进程，彼此竞争直到注册表卡死 | 数据没事 —— 各项目的 `.db` 文件完好。杀掉所有带 `--cbm-daemon-internal` 标记的进程（只杀这些；不带标记的是会话自有的 MCP 服务器），然后**在会话内的终端里**执行 `daemon start`。用 [SessionStart 钩子](#让代码图谱保持存活)自动化 |
 | 图谱答案看起来过时 | `auto_watch=true` 只刷新**已索引**项目，而 `auto_index=false` —— 新仓库永远不会被自动收录 | 每个新仓库执行一次 `index_repository` |
+| 智能体运行 `codebase-memory-mcp cli …` 时永远卡住，CPU 0% | CLI 也会从 stdin 读取 JSON 参数（`echo '<json>' \| codebase-memory-mcp cli <tool>`），只要 stdin 不是终端就会等待 EOF —— 而智能体的 shell 工具从不发送。实测：关闭 stdin 用时 4 秒，让 stdin 保持打开 15 秒则用时 16 秒 | 关闭 stdin：`codebase-memory-mcp cli list_projects < /dev/null`。在 macOS 上的 Claude Code 中遇到 |
+| 把 `codebase-memory-mcp` 升级到 0.11 并重新索引后，每个仓库都出现两次 | 0.11 按完整路径命名项目（根路径中的 `/` 换成 `-`，例如 `Users-<you>-Projects-<repo>`），不再用文件夹名，所以重新索引会在旧项目旁新建一个 —— 旧项目的过期图谱仍会被搜到 | 对每个短名称的重复项执行 `delete_project --project <旧名称>`。它们只含可再生的图谱数据；若用 `manage_adr` 存过 ADR，先把它们导出。升级本身请重新运行第 3 步的安装脚本：`update` 只会指向它的一份本地副本，而 0.11 之前的安装从未放置过 |
 | **提示词发不出去**：`A hook blocked your prompt … claude-mem worker unreachable for N consecutive hooks` | worker 已死但 `:37777` 套接字幸存，启动器拒绝启动副本，健康检查失败 —— 同步的 `UserPromptSubmit` 钩子于是阻塞输入。自我维持的死锁 | 先禁用插件恢复打字，再应用 [`watchdog/`](watchdog)。见[上一节](#别让-claude-mem-卡住你的输入) |
 | 端口的监听者 PID 根本不存在（`taskkill: process not found`） | 孤儿套接字 —— 句柄被子进程继承并比属主活得更久。对 claude-mem 而言元凶是它自己的 `chroma-mcp.exe` 和 python worker，在 worker 死后仍在运行 | 杀掉这些辅助进程，再用真正的 bind（`[System.Net.Sockets.TcpListener]`）确认 —— 最后一个句柄关闭前，`netstat` 仍会列出这个幽灵。无需重启 |
-| Serena 在 TypeScript（或其他语言）文件上报 `Cannot extract symbols from <文件>. Active language servers: ['python']` | **不是缺少语言支持。** Serena 一次只持有一个项目并绑定到会话的工作目录，因此只启动了该项目的 language server | 调用 `activate_project("<仓库路径>")` 后重试。已验证：激活 TS 仓库后 `typescript` 服务器启动，符号提取正常 |
-| 智能体声称 `semantic_query` / `activate_project`「不存在」 | `semantic_query` 是 **`search_graph` 的参数**而非工具，所以在工具列表里搜不到。`activate_project` 确实存在，只是关键词检索排序靠后 | 用 `search_graph(semantic_query=["a","b"])`；按精确名称选择 `activate_project` |
+| Serena 在 TypeScript（或其他语言）文件上报 `Cannot extract symbols from <文件>. Active language servers: ['python']` | **不是缺少语言支持。** Serena 一次只持有一个项目并绑定到会话的工作目录，因此只启动了该项目的 language server | 会话在仓库外启动：调用 `activate_project("<仓库路径>")` 后重试 —— 已验证，激活 TS 仓库后 `typescript` 服务器启动，符号提取正常。会话在仓库内启动：这个会话不会有别的项目（见下一行）—— 请在目标仓库里另开会话 |
+| 智能体声称 `semantic_query` / `activate_project`「不存在」 | `semantic_query` 是 **`search_graph` 的参数**而非工具，所以在工具列表里搜不到。`activate_project` 只存在于在仓库**之外**启动的会话中，那时只是关键词检索把它排得靠后。在仓库内启动时，`claude-code` 上下文是单项目模式（`single_project: true`），会有意移除它 —— 工具数是 21 而不是 23 | 用 `search_graph(semantic_query=["a","b"])`；按精确名称选择 `activate_project`。若它确实不存在，说明会话已绑定到所在仓库 —— 处理其他仓库请在那里启动会话 |
 | 明明改了很多文件，`detect_changes` 却返回 `seed_symbols: 0` | 它对比的是 `base_branch`（默认 `main`）或 `since` —— 未提交的工作区改动解析不出符号 | 先提交，或传入正确的 `base_branch`/`since`，或改用 `trace_path` 评估影响面 |
 | `uv tool install --force` 报错：*"failed to remove directory … reparse point … (os error 4395)"* | 报错有误导性 —— 通常根本没有 reparse point。先停掉所有 `serena.exe`；仍失败则需强制删除目录 | `robocopy <空目录> <工具目录> /MIR`，再 `rmdir /s /q`，然后重装 |
+| 重装后 `serena --version` 显示 `2.0.0.dev0`，且 `activate_project` 要求 `session_id` | 不固定版本的安装会拿到 Serena 的 `main`，它自 2026-09-15 起是尚未发布的 2.0 线：`activate_project` 需要来自 `initial_instructions` 的 `session_id`，而 [`CLAUDE.md`](CLAUDE.md) 中的 `activate_project("<路径>")` 写法不会传它；应用也改为 GPL-3.0 许可 | 用第 4 步带固定版本的命令加 `--force` 重装 |
 | **所有插件突然显示 `Disabled` 且无法重新启用** | 有东西把 `~/.claude/settings.json` 重写成了带 **BOM** 的 UTF-8 —— PowerShell 5.1 的 `Set-Content -Encoding UTF8` 正是如此。开头的 `EF BB BF` 会让严格的 JSON 解析器整份文件都拒绝，于是里面所有设置全部失效 | 去掉 BOM 重写：`node -e "const f=require('fs'),p='<文件>';let s=f.readFileSync(p,'utf8');if(s.charCodeAt(0)===0xFEFF)s=s.slice(1);f.writeFileSync(p,JSON.stringify(JSON.parse(s),null,2))"`。切勿用 `Set-Content -Encoding UTF8` 往返写 Claude 的配置；改用 `[System.IO.File]::WriteAllText($p,$json,(New-Object System.Text.UTF8Encoding($false)))` |
-| **`claude-mem.db` 膨胀到数 GB**，而记忆本身只有约 100 MB | 每次变更都写入 `sync_outbox`，但只有云同步会消费它——若从未配置云同步，队列只增不减：六周 360 万行 / 1.2 GB（[#4228](https://github.com/thedotmack/claude-mem/issues/4228)） | 停掉 worker，`DELETE FROM sync_outbox`，再 `VACUUM`（此处 1573 → 107 MB）。[`prune-outbox.ts`](watchdog/prune-outbox.ts) 由看门狗每日执行，若已配置云同步则不动队列 |
+| **`claude-mem.db` 膨胀到数 GB**，而记忆本身只有约 100 MB | 每次变更都写入 `sync_outbox`，但只有云同步会消费它——若从未配置云同步，队列只增不减：六周 360 万行 / 1.2 GB（[#4228](https://github.com/thedotmack/claude-mem/issues/4228)） | 升级 claude-mem：在 13.28.0 上，50 多条新观察之后 outbox 仍为 0 行（#4228 已作为已修复关闭）。已积压的部分清理一次即可：停掉 worker，`DELETE FROM sync_outbox`，再 `VACUUM`（此处 1573 → 107 MB，另一台机器 168 → 34 MB）。[`prune-outbox.ts`](watchdog/prune-outbox.ts) 仍由看门狗每日执行以照顾旧版本，若已配置云同步则不动队列 |
 | PowerShell 5.1 脚本报 *"The property cannot be found on this object"* | 在 5.1 上，对 `ConvertFrom-Json` 对象中不存在的键做 `$json.NewKey = value` 会抛异常 | 改用 `Add-Member -NotePropertyName ... -Force` |
 | 路径变量变成了类似 `MSFT_TaskSettings3` 的东西 | PowerShell 变量名**不区分大小写** —— `$settings` 会悄悄覆盖 `$Settings` | 重命名其中一个 |
 | 原生 `.exe` 的输出显示为红色 `NativeCommandError` | PowerShell 会这样包装原生程序的 stderr；程序并没有失败 | 看退出码，别看颜色 |

@@ -12,7 +12,7 @@ Two code-intelligence servers are installed globally. They are not interchangeab
 - The graph spans every indexed repo at once — use it for anything cross-repo.
 
 ### Precise references, edits, type checking → `serena` (live LSP)
-- **Serena holds one project at a time.** It activates the session's working directory; if you touch a repo outside it, call `activate_project("<path>")` first. A wrong active project means the wrong language servers are running and symbol lookups fail with `Cannot extract symbols ... Active language servers: [...]` — that is a binding problem, not missing language support.
+- **Serena holds one project at a time.** A session started inside a repo is bound to that repo for its whole life: `activate_project` is disabled by design (single-project context), so other repos are out of Serena's reach — use the graph for them. A session started outside any repo has no project until you call `activate_project("<path>")`. A wrong or missing project means the wrong language servers are running and symbol lookups fail with `Cannot extract symbols ... Active language servers: [...]` — that is a binding problem, not missing language support.
 - `find_symbol` / `get_symbols_overview` when you need current on-disk truth rather than the index.
 - `find_referencing_symbols` before changing a symbol — LSP-accurate, use this for the impact check a refactor depends on.
 - Edit at symbol level: `replace_symbol_body`, `insert_after_symbol`, `insert_before_symbol`, `rename_symbol`, `safe_delete_symbol`; then `get_diagnostics_for_file`.
