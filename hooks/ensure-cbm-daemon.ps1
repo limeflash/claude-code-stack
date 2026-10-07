@@ -18,7 +18,7 @@ $ErrorActionPreference = 'SilentlyContinue'
 $cbm = Join-Path $env:LOCALAPPDATA 'Programs\codebase-memory-mcp\codebase-memory-mcp.exe'
 if (-not (Test-Path $cbm)) { exit 0 }
 
-$log = Join-Path $env:USERPROFILE '.claude-mem-watchdog\watchdog.log'
+$log = Join-Path $env:USERPROFILE '.claude\hooks\cbm-daemon.log'
 function Note($m) {
     "$(Get-Date -Format 'yyyy-MM-ddTHH:mm:ss') [cbm-hook] $m" | Add-Content -Path $log -Encoding UTF8
 }

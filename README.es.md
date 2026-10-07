@@ -20,7 +20,7 @@
 
 ---
 
-Cuatro herramientas que le dan a Claude Code memoria capaz de sobrevivir a una sesión y un mapa estructural de tu código — más el `CLAUDE.md` global que le asigna a cada una su función. Instalado y verificado de principio a fin; lo que de verdad te interesa son los [tropiezos](#tropiezos), porque cada entrada costó tiempo real de depuración.
+Tres herramientas que le dan a Claude Code memoria capaz de sobrevivir a una sesión y un mapa estructural de tu código — más el `CLAUDE.md` global que le asigna a cada una su función. Instalado y verificado de principio a fin; lo que de verdad te interesa son los [tropiezos](#tropiezos), porque cada entrada costó tiempo real de depuración.
 
 ## Contenido
 
@@ -28,15 +28,14 @@ Cuatro herramientas que le dan a Claude Code memoria capaz de sobrevivir a una s
 - [Instalación](#instalación) · [Verificación](#verificación)
 - [**Prompts para pegar**](#prompts-para-pegar) ← empieza aquí tras instalar
 - [**Cómo elegir el modelo**](#cómo-elegir-el-modelo) — medido, no supuesto
-- [**Dos semanas después**](#dos-semanas-después) — lo que realmente hizo
+- [**Por qué dejamos claude-mem**](#por-qué-dejamos-claude-mem) — lo que enseñaron dos meses con él
 - [Tropiezos](#tropiezos) · [Coste y consumo](#coste-y-consumo) · [Privacidad](#privacidad)
 
 ## El stack
 
 | Herramienta | Qué aporta | Cómo corre |
 |---|---|---|
-| **[claude-mem](https://github.com/thedotmack/claude-mem)** | Memoria **conversacional** entre sesiones. Registra lo ocurrido e inyecta el trabajo pasado relevante al arrancar. | Worker local + SQLite + Chroma |
-| **[claude-mem-ollama-proxy](https://github.com/limeflash/claude-mem-ollama-proxy)** | Redirige la generación de memoria de claude-mem a **Ollama Cloud**, desactiva el reasoning y **censura secretos** antes de que nada salga de la máquina. | Proxy local en `127.0.0.1:11435` |
+| **[quipu](https://github.com/limeflash/quipu)** | Memoria entre sesiones **que se escribe sola**. Los hooks registran lo que hizo el agente, un modelo barato en la nube lo comprime en unos pocos registros y la siguiente sesión en el mismo repo arranca con ellos. Es un fork de [engram](https://github.com/Gentleman-Programming/engram), así que el agente también puede buscar y guardar por su cuenta. | Un binario en Go + SQLite, dentro del servidor MCP |
 | **[codebase-memory-mcp](https://github.com/DeusData/codebase-memory-mcp)** | **Grafo de conocimiento del código** persistente — funciones, cadenas de llamadas, rutas, enlaces entre repos. Respuestas de arquitectura en milisegundos. | Binario nativo + demonio |
 | **[serena](https://github.com/oraios/serena)** | Navegación **LSP** en vivo por símbolos, referencias exactas y *edición* a nivel de símbolo. | Language servers por proyecto |
 
@@ -44,11 +43,12 @@ Cuatro herramientas que le dan a Claude Code memoria capaz de sobrevivir a una s
 
 ```mermaid
 flowchart LR
-    CC["Sesión de Claude Code"]
+    CC["Sesión de Claude Code / Codex"]
 
-    CC -->|"qué pasó antes"| CM["claude-mem<br/>worker :37777"]
-    CM --> PX["ollama proxy :11435<br/>sin reasoning · secretos censurados"]
-    PX ==>|"el único tráfico que sale"| OC[("Ollama Cloud")]
+    CC -->|"hooks: qué se hizo"| CAP["engram-capture<br/>secretos censurados · ~40 ms"]
+    CAP --> MEM[("memoria<br/>SQLite local")]
+    MEM <-->|"comprimir, ~6k tokens / llamada"| OC[("Ollama Cloud<br/>plan B: Codex → Claude")]
+    CC -->|"qué pasó antes"| MEM
 
     CC -->|"dónde está X · quién llama a X<br/>arquitectura · impacto"| CBM["codebase-memory-mcp<br/>demonio · UI :9749"]
     CBM --> GR[("grafo de código<br/>SQLite local")]
@@ -57,11 +57,12 @@ flowchart LR
     SR --> LS["language servers"]
 
     style OC fill:#f9d5d5,stroke:#c96
+    style MEM fill:#d5e8d4,stroke:#82b366
     style GR fill:#d5e8d4,stroke:#82b366
     style LS fill:#d5e8d4,stroke:#82b366
 ```
 
-Todo lo verde se queda en tu máquina. Lo único que sale es la generación de memoria, y pasa por el proxy que primero elimina las credenciales.
+Todo lo verde se queda en tu máquina. Lo único que sale es la compresión de la memoria, y las credenciales se eliminan en el hook, antes de que el evento llegue siquiera a escribirse en disco.
 
 ## Por qué dos herramientas de código
 
@@ -74,33 +75,43 @@ Instalar un grafo de código *y* un servidor LSP sin una regla hace que el agent
 
 Si el grafo y los archivos discrepan, **mandan los archivos**: reindexa en lugar de fiarte de una respuesta caduca.
 
+La memoria responde a otra pregunta — *qué hicimos y decidimos antes* — así que no compite con ninguna de las dos.
+
 ## Instalación
 
-El orden importa: el proxy modifica `~/.claude-mem/settings.json`, así que claude-mem debe existir antes.
+### 1 · quipu (memoria)
 
-### 1 · claude-mem
-
-```powershell
-npx claude-mem install
-```
-
-Elige el runtime **Worker**. Sirve cualquier proveedor compatible con OpenAI — el proxy lo sobrescribe en el paso 2 — así que lo más barato es pegar una clave de **Ollama** desde [ollama.com/settings/keys](https://ollama.com/settings/keys).
-
-> El instalador puede terminar con `Fatal error: ENOENT ... .install-version` y un aviso `ERESOLVE` de npm. **Ambos son inofensivos** — ver [tropiezos](#tropiezos).
-
-### 2 · Proxy de Ollama
+Se compila desde el código fuente; requiere Go 1.25+.
 
 ```powershell
-git clone https://github.com/limeflash/claude-mem-ollama-proxy.git
-cd claude-mem-ollama-proxy
-.\windows\install.ps1
+git clone https://github.com/limeflash/quipu.git
+cd quipu
+$bin = "$env:LOCALAPPDATA\Programs\engram"
+go build -o "$bin\engram.exe" ./cmd/engram
+go build -ldflags "-s -w" -o "$bin\engram-capture.exe" ./cmd/engram-capture
+[Environment]::SetEnvironmentVariable('Path', [Environment]::GetEnvironmentVariable('Path','User') + ";$bin", 'User')   # lo verán las terminales nuevas
+
+New-Item -ItemType Directory -Force "$HOME\.engram" | Out-Null
+Set-Content "$HOME\.engram\autocapture.json" '{}'      # activa la captura
+Set-Content "$HOME\.engram\ollama.key" '<tu clave>'    # de ollama.com/settings/keys
 ```
 
-En macOS/Linux: `./macos/install.sh`. Registra una tarea al iniciar sesión (sin permisos de administrador), apunta claude-mem a `http://127.0.0.1:11435/v1` y usa `deepseek-v4.1-flash` por defecto. Otro modelo: `-Model "gpt-oss:120b"` — lista en `https://ollama.com/v1/models`.
+El binario conserva el nombre de engram. Después:
 
-Inyecta `reasoning_effort: "none"`. Sin eso, un modelo de razonamiento devuelve la respuesta en `reasoning`, deja `content` vacío y claude-mem no guarda nada sin avisar.
+- fusiona [`docs/fork/claude-settings.json`](https://github.com/limeflash/quipu/blob/main/docs/fork/claude-settings.json) en `~/.claude/settings.json` — captura en `PostToolUse` / `UserPromptSubmit` / `Stop`, memoria en `SessionStart`;
+- registra el servidor MCP (conjunto de herramientas de solo lectura — el agente lee la memoria sin que nadie le insista en escribirla):
 
-### 3 · codebase-memory-mcp
+```powershell
+claude mcp add engram -s user -- "$env:LOCALAPPDATA\Programs\engram\engram.exe" mcp --tools=mem_search,mem_context,mem_get_observation,mem_timeline,mem_current_project,mem_list_projects
+```
+
+- **Codex** también: añade [`docs/fork/codex-config.toml`](https://github.com/limeflash/quipu/blob/main/docs/fork/codex-config.toml) a `~/.codex/config.toml` y aprueba los hooks nuevos una vez en un `codex` interactivo.
+- **Planes B** cuando se agota la cuota de Ollama: Codex sirve si `codex` tiene la sesión iniciada; para Claude, guarda la salida de `claude setup-token` en `~/.engram/claude.token`.
+- **Si vienes de claude-mem:** `engram import claude-mem --dry-run --root <carpeta de tus repos>` y luego lo mismo sin `--dry-run`.
+
+Todo lo demás — configuración, comandos, cómo se ordenan los registros — está en el [README de quipu](https://github.com/limeflash/quipu#readme).
+
+### 2 · codebase-memory-mcp
 
 ```powershell
 Invoke-WebRequest -Uri https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/install.ps1 -OutFile install.ps1
@@ -118,7 +129,7 @@ codebase-memory-mcp cli list_projects
 
 Indexa **cada repo por separado**. Una carpeta paraguas llena de `node_modules` y artefactos de build produce un amasijo inútil en vez de grafos limpios por proyecto.
 
-### 4 · Serena
+### 3 · Serena
 
 ```powershell
 uv tool install --from git+https://github.com/oraios/serena@9f9db76622340930d66aba9f72a2349b30bb1e29 serena-agent
@@ -127,7 +138,7 @@ claude mcp add serena -s user -- serena start-mcp-server --context claude-code -
 
 **No quites el pin.** Es el último commit de la línea 1.x (2026-09-06, versión `1.7.1.dev0`). Desde el 2026-09-15 el `main` de Serena es la `2.0.0.dev0` aún sin publicar: allí `activate_project` exige un `session_id` que las reglas de [`CLAUDE.md`](CLAUDE.md) no pasan, y la aplicación pasa a licencia GPL-3.0. Mueve el pin cuando salga la 2.0 y las reglas estén adaptadas. Para reinstalar o actualizar usa `--force`; si no consigue borrar el directorio antiguo, ver [tropiezos](#tropiezos).
 
-### 5 · Instrucciones globales
+### 4 · Instrucciones globales
 
 Copia [`CLAUDE.md`](CLAUDE.md) a `~/.claude/CLAUDE.md`. Se carga en cada sesión automáticamente, así que las reglas se aplican sin que digas nada.
 
@@ -136,17 +147,14 @@ Mantenlo **en inglés** aunque trabajes en otro idioma: es configuración que le
 ## Verificación
 
 ```powershell
-Get-ScheduledTask -TaskName claude-mem-ollama-proxy
-Get-Content "$env:USERPROFILE\.claude-mem-proxy\proxy.log" -Tail 5
-# línea sana: POST /v1/chat/completions -> 200 [reasoning_effort=none]
-
-Invoke-WebRequest http://localhost:37777 -UseBasicParsing | Select-Object StatusCode
+engram autocapture probe         # una llamada mínima a cada modelo de la cadena: "ok" por línea
+engram autocapture status        # el spool debe vaciarse a 0; llamadas / tokens / registros por día
 
 codebase-memory-mcp daemon status
 codebase-memory-mcp cli list_projects        # UI: http://127.0.0.1:9749
 ```
 
-En Claude Code, `/mcp` debería listar `serena` y `codebase-memory-mcp`. **Los servidores MCP solo se conectan al arrancar — reinicia Claude Code tras instalar.**
+En Claude Code, `/mcp` debería listar `engram`, `serena` y `codebase-memory-mcp`, y una sesión nueva en un repo indexado debería abrirse con un bloque `<engram-memory project="…">` en cuanto haya algo que recordar. **Los servidores MCP solo se conectan al arrancar — reinicia Claude Code tras instalar.**
 
 ## Prompts para pegar
 
@@ -185,10 +193,18 @@ Esa última frase importa: sin ella, un servidor MCP ausente se convierte en un 
 ```text
 Revisa mi instalación y dime qué está realmente roto, no qué debería estar:
 - ¿está activo el demonio de codebase-memory-mcp y cuántos proyectos hay indexados?
-- ¿está conectado serena?
-- ¿responde el worker de claude-mem en http://localhost:37777?
-- ¿muestra ~/.claude-mem-proxy/proxy.log líneas recientes "-> 200 [reasoning_effort=none]"?
+- ¿están conectados serena y engram?
+- ¿pasa `engram autocapture probe` y muestra `engram autocapture status` el spool vaciándose
+  y llamadas recientes a los modelos sin errores?
 Para cada fallo dame la causa y el arreglo — no te limites a reiniciar cosas.
+```
+
+### Recuerdo — qué pasó antes
+
+```text
+Antes de empezar: busca en la memoria qué se hizo y qué se decidió sobre <tema> en este proyecto, y en otros
+proyectos si aquí no está (mem_search con all_projects=true). Abre completos los registros más relevantes y
+dime qué sigue vigente — si discrepan, manda el código.
 ```
 
 ### Montar una máquina nueva
@@ -208,42 +224,9 @@ carpetas que solo tengan artefactos de build o datasets. Después muéstrame la 
 número de nodos y aristas.
 ```
 
-## Evitar que claude-mem te bloquee
-
-El hook `UserPromptSubmit` de claude-mem es **síncrono**. Cuando el worker no responde, sale con código distinto de cero y Claude Code **bloquea tu prompt** — visto de verdad: 77 prompts rechazados seguidos. El plugin marca sus hooks `PostToolUse`, `PreToolUse` y `Stop` como `"async": true`, que no pueden bloquear; justo el único que se interpone entre tú y tu teclado, no.
-
-Y se atasca porque el fallo se retroalimenta: el worker muere, su socket de escucha en `:37777` sobrevive (heredado por un hijo vivo), el lanzador ve el puerto ocupado y registra `Port already in use, refusing to start duplicate`, nadie responde a los health checks, así que todos los hooks fallan — para siempre.
-
-Dos capas, ambas en [`watchdog/`](watchdog):
-
-**1. Endurecer los hooks — la garantía.** [`harden-hooks.js`](watchdog/harden-hooks.js) envuelve los hooks bloqueantes en una subshell:
-
-```bash
-node watchdog/harden-hooks.js ~/.claude/plugins/cache/thedotmack/claude-mem/<versión>/hooks/hooks.json
-```
-
-Un `exit 1` dentro del comando original ahora solo termina la subshell, y el `exit 0` final se ejecuta igual — así que un worker muerto te cuesta unas cuantas observaciones, no la capacidad de escribir. Es idempotente; repítelo tras actualizar el plugin, porque la caché se sobrescribe.
-
-**2. Watchdog — la recuperación.** [`claude-mem-watchdog.ps1`](watchdog/claude-mem-watchdog.ps1) como tarea programada, cada 5 minutos. Relanza el proxy de Ollama en `:11435` cuando se cae: ese corre en una ventana de consola, así que un Ctrl+C accidental lo mata y a partir de ahí el worker sigue reportándose sano mientras cada petición de generación falla en silencio.
-
-Sobre el worker actúa bajo **una sola** condición: `:37777` está **ocupado pero nadie responde**. Ese es el bloqueo real. A un worker que sencillamente no está no lo toca, porque claude-mem apaga su generador tras unos 3 minutos de inactividad (`Idle timeout reached, triggering abort to kill subprocess`) y un hook lo relanza en el siguiente prompt. Equivocarse aquí sale caro — ver [Dos semanas después](#dos-semanas-después).
-
-Sale de inmediato si no hay ningún cliente de agente corriendo, y también si desactivaste el plugin: sin cliente no hay consumidor, y un plugin desactivado es una decisión, no un fallo. Un mutex global cubre por igual las ejecuciones programadas y las manuales: dos copias llegaron a pelearse y una mató el demonio sano que la otra acababa de levantar.
-
-**Lánzalo mediante [`run-hidden.vbs`](watchdog/run-hidden.vbs), no directamente.** El Programador de tareas, al ejecutar una aplicación de consola en una sesión interactiva, hace parpadear una ventana en cada ejecución. Cada cinco minutos, encima de lo que estés haciendo — incluidos juegos a pantalla completa, de los que te saca. `wscript` no tiene consola propia y `Run(..., 0, False)` arranca el hijo oculto:
-
-```powershell
-$vbs = "$env:USERPROFILE\.claude-mem-watchdog
-un-hidden.vbs"
-$a = New-ScheduledTaskAction -Execute wscript.exe -Argument "//nologo `"$vbs`""
-Set-ScheduledTask -TaskName claude-mem-watchdog -Action $a
-```
-
-`-WindowStyle Hidden` por sí solo no basta, y la solución limpia — un principal S4U que nunca toca el escritorio — requiere permisos de administrador.
-
 ## Mantener vivo el grafo de código
 
-El daemon de `codebase-memory-mcp` necesita **otro mecanismo**, y aquí está la trampa: su daemon y su CLI se encuentran mediante una tubería con nombre cuyo nombre es un hash del contexto de arranque.
+El daemon de `codebase-memory-mcp` necesita un mantenimiento deliberado para seguir vivo, y aquí está la trampa: su daemon y su CLI se encuentran mediante una tubería con nombre cuyo nombre es un hash del contexto de arranque.
 
 ```
 arrancado por el Programador de tareas : cbm-daemon-bc0bed48…
@@ -252,26 +235,17 @@ arrancado desde una sesión             : cbm-daemon-2a438ffc…
 
 Por eso un daemon lanzado desde una tarea programada funciona perfectamente, ocupa el puerto de la UI y es **permanentemente invisible**: `daemon status` dice "not running" junto a un proceso vivo. Entonces la CLI levanta un daemon desechable por cada comando, esos compiten entre sí, el registro se atasca y la lista de proyectos sale vacía. Los archivos `.db` de cada proyecto nunca se ven afectados; lo que se rompe es el registro.
 
-Así que lo mantiene vivo un **hook SessionStart de Claude Code**, que corre en el contexto donde el nombre de la tubería sí coincide: [`ensure-cbm-daemon.ps1`](watchdog/ensure-cbm-daemon.ps1) tras el envoltorio "dispara y olvida" [`cbm-daemon-ensure.cmd`](watchdog/cbm-daemon-ensure.cmd). Copia ambos a `~/.claude/hooks/` y registra el envoltorio en cada matcher `SessionStart` de `~/.claude/settings.json`:
+Así que lo mantiene vivo un **hook SessionStart de Claude Code**, que corre en el contexto donde el nombre de la tubería sí coincide: [`ensure-cbm-daemon.ps1`](hooks/ensure-cbm-daemon.ps1) tras el envoltorio "dispara y olvida" [`cbm-daemon-ensure.cmd`](hooks/cbm-daemon-ensure.cmd). Copia ambos a `~/.claude/hooks/` y registra el envoltorio en cada matcher `SessionStart` de `~/.claude/settings.json`:
 
 ```json
 { "type": "command", "command": "cmd.exe /d /v:off /s /c '\"\"%USERPROFILE%\\.claude\\hooks\\cbm-daemon-ensure.cmd\"\"'", "timeout": 10 }
 ```
 
-El envoltorio devuelve en ~40 ms con código 0 — desacopla el trabajo real, así que una reparación lenta o fallida nunca puede retrasar ni bloquear una sesión. Y como solo corre al iniciar una sesión, el daemon existe justo cuando algo lo necesita. No resucita el plugin si tú lo desactivaste, nunca toca tus sesiones de Claude Code, y omite al dueño del puerto salvo que sea realmente un worker de claude-mem — el proceso `.claude-mem-proxy` cae dentro de un filtro ingenuo `*claude-mem*` y no debe morir.
-
-```powershell
-$s = "$env:USERPROFILE\.claude-mem-watchdog\watchdog.ps1"
-$a = New-ScheduledTaskAction -Execute powershell.exe -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$s`""
-$t = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 5)
-Register-ScheduledTask -TaskName claude-mem-watchdog -Action $a -Trigger $t
-```
-
-**Cuando el PID dueño del puerto está muerto**, el descriptor lo heredó un hijo que sobrevivió al worker. En la práctica ese hijo es el propio stack Chroma de claude-mem — `chroma-mcp.exe` y sus workers de python — huérfanos desde que murió el worker, y **no** una sesión del editor. El watchdog mata esos, y luego demuestra que el puerto quedó realmente libre con un bind de verdad antes de relanzar; una línea `LISTENING` en `netstat` no prueba nada en ninguna dirección. Si algo que no puede identificar sigue ocupando el puerto, lo registra y se detiene en vez de matar procesos al azar.
+El envoltorio devuelve en ~40 ms con código 0 — desacopla el trabajo real, así que una reparación lenta o fallida nunca puede retrasar ni bloquear una sesión. Y como solo corre al iniciar una sesión, el daemon existe justo cuando algo lo necesita. Solo se detienen los procesos que llevan la marca del daemon; los que no la llevan son servidores MCP de sesiones abiertas. Registra lo que hace en `~/.claude/hooks/cbm-daemon.log`.
 
 ## Cómo elegir el modelo
 
-**Usa `deepseek-v4.1-flash`.** Se midió, no se supuso: ocho sesiones reales de esta máquina con la respuesta correcta conocida, puntuadas según si el resumen conservó el hecho que importaba.
+**Usa `deepseek-v4.1-flash`** — el valor por defecto de quipu, con `glm-5.3-flash` como respaldo. Se midió, no se supuso: ocho sesiones reales de esta máquina con la respuesta correcta conocida, puntuadas según si el resumen conservó el hecho que importaba.
 
 | | **deepseek-v4.1-flash** | glm-5.3-flash | deepseek-v4-flash:0731 (retirado) |
 |---|---|---|---|
@@ -280,25 +254,15 @@ Register-ScheduledTask -TaskName claude-mem-watchdog -Action $a -Trigger $t
 | Latencia | **0,6 s** | 5,2 s | 0,9 s |
 | Cuota de sesión por llamada | **< 0,007%** | ~0,020% | — |
 
-El `0731` retirado perdía el número `266` de «273 intentos, 266 fallos, 5 éxitos» y se contradecía, y en la sesión que costó dos horas entender omitió que el apagado era **por diseño**, que era todo el hallazgo. `glm-5.3-flash` lo corrigió, por eso fue la recomendación durante un tiempo. `deepseek-v4.1-flash` conserva los mismos hechos que GLM con una octava parte de tokens y latencia y como mucho un tercio de la cuota; leído a mano es incluso más limpio: GLM se inventó «on locked dirs» en un resumen. La latencia apenas importa (la generación corre en el hook `Stop` en segundo plano); la cuota sí, ver abajo.
+El `0731` retirado perdía el número `266` de «273 intentos, 266 fallos, 5 éxitos» y se contradecía, y en la sesión que costó dos horas entender omitió que el apagado era **por diseño**, que era todo el hallazgo. `glm-5.3-flash` lo corrigió; `deepseek-v4.1-flash` conserva los mismos hechos con una octava parte de tokens y latencia y como mucho un tercio de la cuota, y leído a mano es incluso más limpio: GLM se inventó «on locked dirs» en un resumen.
 
 ### Los modelos que razonan necesitan el endpoint nativo
 
-Si aun así usas un modelo que piensa en voz alta (GLM y similares), el camino obvio falla. El `/v1/chat/completions` compatible con OpenAI de Ollama no acepta el parámetro `think` ([ollama#15288](https://github.com/ollama/ollama/issues/15288), [#15293](https://github.com/ollama/ollama/issues/15293)), así que el modelo o narra dentro de `content` —1300–1600 caracteres de «The user wants me to compress…»— o devuelve `content` vacío. El proxy enruta esos modelos (`CMP_THINK_MODELS`, por defecto `glm-*`) por el `/api/chat` nativo. Tres detalles deciden si funciona:
-
-- **`think: true`, no `false`.** `true` pone la deliberación en su propio campo `thinking` y deja `content` para la respuesta; `false` reinserta la cháchara en `content`.
-- **Margen de presupuesto** (`CMP_THINK_HEADROOM`, por defecto 1200). El `max_tokens` de quien llama presupuesta la respuesta; sin margen para el razonamiento oculto el modelo muere a mitad cada vez.
-- **Un plan B** (`CMP_THINK_FALLBACK`, por defecto `deepseek-v4.1-flash`) ante cualquier 4xx/5xx, para que un rechazo empeore el resumen en vez de perderlo. Mantenlo apuntando a un modelo que exista: el valor por defecto de este repo era `deepseek-v4-flash:0731` hasta que Ollama lo retiró y cada plan B respondía 410.
+El `/v1/chat/completions` compatible con OpenAI de Ollama no acepta el parámetro `think` ([ollama#15288](https://github.com/ollama/ollama/issues/15288), [#15293](https://github.com/ollama/ollama/issues/15293)), así que un modelo que razona o narra dentro de `content` —1300–1600 caracteres de «The user wants me to compress…»— o devuelve `content` vacío. quipu habla únicamente con el `/api/chat` nativo, con `think: false` — salvo los prefijos de modelo listados en `ollama.think` (por defecto `glm-`), que reciben `think: true`: eso pone la deliberación en su propio campo `thinking` y deja `content` para la respuesta, mientras que `false` se limita a reinsertar la cháchara. Además, Ollama ignora el esquema JSON de `format`, así que la respuesta se valida en local y tiene una ronda de reparación.
 
 ### Cuánto cuesta en realidad, y en qué se equivocó este repo
 
-Ollama Cloud es una suscripción: los tokens no son dinero (el coste medido aquí fue $0.00000). Lo que se agota es la **cuota**: un límite de sesión de 5 horas y uno semanal, ponderados por modelo y no por token, compartidos por todos los modelos de la cuenta. Consúltala con el endpoint no documentado:
-
-```bash
-curl -H "Authorization: Bearer $OLLAMA_API_KEY" https://ollama.com/api/usage
-```
-
-Devuelve `limits.session` / `limits.weekly` como fracciones de 0 a 1 y recuentos por modelo; `POST /api/me` devuelve el plan.
+Ollama Cloud es una suscripción: los tokens no son dinero. Lo que se agota es la **cuota**: un límite de sesión de 5 horas y uno semanal, ponderados por modelo y no por token, compartidos por todos los modelos de la cuenta.
 
 Una versión anterior de esta sección leyó un 0,5% de uso semanal y prometió «~1% con GLM, unas 100× de margen». **Era falso.** La lectura se tomó justo después de reiniciarse la ventana semanal —el contador marcaba solo 271 peticiones— y se extrapoló desde ahí. Una semana con GLM produjo 4.386 peticiones de GLM y 1.990 de otros, y la cuota semanal llegó al **100%**:
 
@@ -309,35 +273,27 @@ Una versión anterior de esta sección leyó un 0,5% de uso semanal y prometió 
 09-25       1       21.142        6.427
 ```
 
-Como la cuota es de toda la cuenta, todos los modelos respondieron 429 a la vez, el plan B no sirvió de nada, y claude-mem siguió reintentando —hasta 26.000 llamadas rechazadas al día— mientras la memoria dejó de escribirse casi una semana. Dos lecciones: **lee `/api/usage` al final de la semana, nunca justo después de un reinicio**, y en una suscripción el peso del modelo que razona en la cuota importa mucho más que sus tokens.
+Como la cuota es de toda la cuenta, todos los modelos respondieron 429 a la vez, el modelo de respaldo no sirvió de nada, y claude-mem siguió reintentando —hasta 26.000 llamadas rechazadas al día— mientras la memoria dejó de escribirse casi una semana. Por eso quipu nunca reintenta en bucle un modelo que lo ha rechazado: un 429 bloquea ese modelo durante 15 minutos, que se duplican hasta un máximo de 2 horas, y el lote pasa al siguiente de la cadena. El segundo modelo de Ollama normalmente también rechaza —la cuota es de toda la cuenta—, así que el trabajo acaba en **Codex** (`gpt-6-luna`, tu plan de ChatGPT) y después en **Claude** (`claude-sonnet-5-5`, tu plan de Claude), cada uno limitado a 20 llamadas por hora. Un 410 —el proveedor retiró el modelo— lo desactiva para siempre. `engram autocapture status` muestra en qué punto está cada modelo.
 
-## Dos semanas después
+## Por qué dejamos claude-mem
 
-Cifras de una máquina con este stack funcionando de forma continua, del 17 al 31 de agosto de 2026:
+Hasta octubre de 2026 este stack usó [claude-mem](https://github.com/thedotmack/claude-mem) detrás de un [proxy](https://github.com/limeflash/claude-mem-ollama-proxy) (ahora archivado) que trasladaba la generación a Ollama Cloud y censuraba los secretos, más un watchdog que mantenía vivo su worker. Funcionaba —solo el proxy eliminó **4.192 credenciales** en dos semanas que de otro modo se habrían enviado literalmente a un modelo de terceros—, pero cada pieza de esa lista existía para parchear algo:
 
-| | |
-|---|---|
-| Base de datos de memoria | 5,5 MB → **51,9 MB** |
-| Observaciones registradas | ~7.900 |
-| Llamadas de generación por el proxy | 7.383, de las cuales **2** no fueron `200` |
-| **Credenciales eliminadas antes de salir de la máquina** | **4.192** |
-| Proxy muerto por un Ctrl+C accidental | 2 — el watchdog relanzó ambos |
-| Bloqueos por socket huérfano resueltos | 4 |
+- su hook síncrono `UserPromptSubmit` **bloqueaba los prompts** cuando el worker moría — una vez, 77 rechazados seguidos;
+- el socket del worker muerto lo heredaban procesos de Chroma huérfanos, así que el worker no podía reiniciarse, y el watchdog tuvo que aprender a distinguirlo de un apagado normal por inactividad — se equivocó **273 veces** en dos semanas, haciendo parpadear una ventana de consola cada cinco minutos;
+- la base de datos creció hasta gigabytes por un outbox de sincronización en la nube que nadie usaba;
+- cada llamada de generación enviaba **~150k tokens de entrada** de historial acumulado; el 5 de octubre eso sumó **2.700 millones** de tokens en un solo día.
 
-**Esos 4.192 son todo el argumento a favor del proxy.** Cada uno era una contraseña, un token o una cadena basic-auth dentro de una conversación que estaba a punto de enviarse literalmente a un modelo de terceros para resumirla. El proxy los sustituyó por `[SECRET:{type}]` antes de enviarla.
+quipu lo sustituye todo por hooks que escriben un archivo y terminan, compresión dentro del servidor MCP que ya está corriendo y llamadas sin estado. Medido sobre las mismas cuatro sesiones el 7 de octubre — claude-mem hasta que se apagó, quipu después:
 
-**Calidad del recuerdo.** Sobre trabajo de hace minutos responde con precisión y concreción — ya había registrado «cambio del principal de la tarea a S4U bloqueado por acceso denegado» y «ventana de powershell ajena identificada como el proceso del terminal Warp» mientras ese trabajo aún ocurría. Pedirle un incidente concreto de hace dos semanas devolvió material vecino en lugar del evento exacto. El recuerdo reciente es fuerte; la puntería a largo plazo es más débil: trátalo como memoria de trabajo, no como un archivo consultable como una base de datos.
+| | claude-mem | quipu |
+|---|---|---|
+| registros por hora de trabajo | 270–330 | 36–66 |
+| notas que solo recuentan código que se leyó | 65% | 29% |
+| tokens de entrada ese día | 343,6 M (media 152k / llamada) | 0,72 M (media 6,4k / llamada) |
+| auditoría a ciegas de 60 registros al azar: útiles / ruido / duplicados | 14 / 45 / 1 | 45 / 11 / 4 |
 
-**Y en qué se equivocó el watchdog.** Leer un reposo sano como avería sale caro:
-
-```
-273  claude-mem worker unhealthy on :37777
-273    respawning worker from 13.15.0
-266    worker still down after 45s      <- no había nada roto
-  5    worker recovered
-```
-
-Un intento de reparación inútil cada cinco minutos durante dos semanas, cada uno haciendo parpadear una consola sobre lo que hubiera en pantalla, juegos a pantalla completa incluidos. El worker nunca estuvo roto: claude-mem simplemente apaga su generador al quedar inactivo. Las dos correcciones (actuar solo ante «ocupado pero sin respuesta» y lanzar vía `wscript`) están en este repositorio.
+claude-mem seguía produciendo más registros útiles por hora en términos absolutos (~70 frente a ~37) — enterrados bajo tres registros de ruido cada uno. Todo el historial de claude-mem (49 mil registros, 1,5 mil resúmenes, 3,1 mil prompts) se importó con `engram import claude-mem`, así que en el cambio no se perdió nada.
 
 ## Tropiezos
 
@@ -345,43 +301,43 @@ Todos estos ocurrieron de verdad.
 
 | Síntoma | Causa | Solución |
 |---|---|---|
-| `npx claude-mem install` acaba con `Fatal error: ENOENT ... marketplaces\thedotmack\plugin\.install-version` | Fallo cosmético de rutas — el archivo se escribe un nivel más arriba | **Ignóralo.** Comprueba que la caché del plugin tiene `node_modules` y que el MCP responde |
-| …y un conflicto `ERESOLVE` de npm con tree-sitter | Instalación redundante de gramáticas **solo de desarrollo**; las dependencias de runtime ya las instaló `bun` | **Ignóralo** |
-| La generación de memoria cuesta una fortuna | Las rutas por defecto cobran por observación (Haiku ≈ 58 $/mil, OpenRouter ≈ 8 $/mil) | Usa el proxy — la generación pasa a tu saldo de Ollama Cloud |
-| claude-mem no guarda nada y no muestra error | El modelo de razonamiento puso el texto en `reasoning` y dejó `content` vacío | El `reasoning_effort: "none"` del proxy |
+| Los hooks nuevos de quipu no hacen nada en **Codex** | Codex ejecuta un hook nuevo o modificado solo después de que confíes en él una vez | Abre un `codex` interactivo y aprueba los hooks |
+| `codex exec` escribe eventos pero nunca un resumen del turno | `codex exec` termina antes de que acabe un hook Stop `async` | Deja `Stop` síncrono — la configuración incluida ya lo hace |
+| Falla el comando de un hook de Codex con comillas o espacios | Codex ejecuta los comandos de los hooks a través de `cmd.exe` por defecto | Usa una ruta simple sin comillas, como en la configuración incluida |
+| Recompilar `engram.exe` falla con "access denied" | Cada sesión de Claude Code y de Codex mantiene el binario abierto a través de su servidor MCP; Windows se niega a sobrescribir un `.exe` en ejecución | Renombra el viejo y luego copia el nuevo — renombrar una imagen en ejecución está permitido. Borra los `*.old-*.exe` cuando se reinicien las sesiones |
+| El plan B de Claude responde `401` | Dentro de una sesión de Claude Code, el `claude -p` hijo hereda variables `ANTHROPIC_*` / `CLAUDE*` que apuntan a las credenciales del padre | quipu las limpia y usa solo `~/.engram/claude.token`, de `claude setup-token` |
+| Un hook PostToolUse añade un retraso visible en Windows | El arranque del proceso crece con el tamaño de la imagen: ~110 ms para un binario de 30 MB, 19 ms para uno de 2 MB | Por eso la captura es un `engram-capture` aparte de 3 MB; mantén los hooks `async` |
 | La instalación de `codebase-memory-mcp` sale con código 1 y el PATH nunca se registra | El fallo de la configuración de un solo agente aborta toda la activación. Una config de **Hermes** en `%LOCALAPPDATA%\hermes\config.yaml` falla de forma determinista, sea cual sea su contenido — [issue #1656](https://github.com/DeusData/codebase-memory-mcp/issues/1656) | Borra o renombra ese directorio, o añade el directorio de instalación al PATH a mano. El resto de agentes se configuran bien |
 | `daemon status` dice "not running" mientras la UI en :9749 responde | Demonios en competencia, normalmente por repetir `install --force` | `daemon stop`, mata los `codebase-memory-mcp.exe` que queden y lanza `daemon start` una vez |
 | **La UI del grafo no lista ningún proyecto**, o `daemon status` dice "not running" mientras un `codebase-memory-mcp.exe` está claramente vivo y sirviendo `:9749` | El daemon se arrancó desde un contexto cuyo hash de nombre de tubería difiere del de la CLI — el Programador de tareas es el sospechoso habitual. Corre y nunca se encuentra, así que cada llamada de la CLI levanta un daemon desechable y esos compiten hasta atascar el registro | Tus datos están bien: los `.db` por proyecto están intactos. Mata todo proceso marcado `--cbm-daemon-internal` (nunca los que no lo llevan, esos son servidores MCP de sesiones abiertas) y luego `daemon start` **desde una terminal dentro de una sesión**. Automatízalo con el [hook SessionStart](#mantener-vivo-el-grafo-de-código) |
 | Las respuestas del grafo parecen caducas | `auto_watch=true` refresca los proyectos **ya indexados**, pero `auto_index=false` — los repos nuevos nunca se recogen solos | Ejecuta `index_repository` una vez por repo nuevo |
 | `codebase-memory-mcp cli …` se queda colgado para siempre al 0% de CPU cuando lo lanza un agente | La CLI también lee sus argumentos JSON de stdin (`echo '<json>' \| codebase-memory-mcp cli <tool>`) y, cuando stdin no es una terminal, espera un EOF — que la herramienta de shell del agente nunca envía. Medido: 4 s con stdin cerrado, 16 s con stdin abierto durante 15 s | Cierra stdin: `codebase-memory-mcp cli list_projects < /dev/null`. Visto desde Claude Code en macOS |
-| Tras actualizar `codebase-memory-mcp` a 0.11 y reindexar, cada repo aparece dos veces | 0.11 nombra los proyectos por su ruta completa (la raíz con `/` cambiado por `-`, p. ej. `Users-<you>-Projects-<repo>`) en vez del nombre de la carpeta, así que reindexar crea un proyecto nuevo junto al viejo, cuyo grafo caduco sigue apareciendo en las búsquedas | `delete_project --project <nombre-viejo>` para cada duplicado de nombre corto. Solo contienen datos derivados del grafo; si guardaste ADRs con `manage_adr`, sácalos antes. Para actualizar, vuelve a ejecutar el instalador del paso 3: `update` solo remite a una copia local suya que las instalaciones anteriores a 0.11 nunca dejaron |
-| **Los prompts dejan de enviarse**: `A hook blocked your prompt … claude-mem worker unreachable for N consecutive hooks` | El worker murió, su socket en `:37777` sobrevivió, el lanzador se niega a crear un duplicado, los health checks fallan — y el hook síncrono `UserPromptSubmit` bloquea la entrada. Se retroalimenta | Desactiva el plugin para volver a escribir y aplica [`watchdog/`](watchdog). Ver [la sección anterior](#evitar-que-claude-mem-te-bloquee) |
-| Un puerto muestra un listener cuyo PID no existe (`taskkill: process not found`) | Socket huérfano — un hijo heredó el descriptor y sobrevivió a su dueño. En claude-mem el culpable es su propio `chroma-mcp.exe` y sus workers de python, aún vivos tras la muerte del worker | Mata esos ayudantes y confirma con un bind real (`[System.Net.Sockets.TcpListener]`) — `netstat` sigue listando el fantasma hasta que se cierra el último descriptor. No hace falta reiniciar |
+| Tras actualizar `codebase-memory-mcp` a 0.11 y reindexar, cada repo aparece dos veces | 0.11 nombra los proyectos por su ruta completa (la raíz con `/` cambiado por `-`, p. ej. `Users-<you>-Projects-<repo>`) en vez del nombre de la carpeta, así que reindexar crea un proyecto nuevo junto al viejo, cuyo grafo caduco sigue apareciendo en las búsquedas | `delete_project --project <nombre-viejo>` para cada duplicado de nombre corto. Solo contienen datos derivados del grafo; si guardaste ADRs con `manage_adr`, sácalos antes. Para actualizar, vuelve a ejecutar el instalador del paso 2: `update` solo remite a una copia local suya que las instalaciones anteriores a 0.11 nunca dejaron |
+| Un puerto muestra un listener cuyo PID no existe (`taskkill: process not found`) | Socket huérfano — un hijo heredó el descriptor y sobrevivió a su dueño | Mata a los hijos que sigan vivos y confirma con un bind real (`[System.Net.Sockets.TcpListener]`) — `netstat` sigue listando el fantasma hasta que se cierra el último descriptor. No hace falta reiniciar |
 | Serena falla con `Cannot extract symbols from <archivo>. Active language servers: ['python']` en un archivo TypeScript (u otro) | **No es falta de soporte del lenguaje.** Serena sostiene un proyecto a la vez y se ancla al directorio de trabajo de la sesión, así que solo están levantados los language servers de ese proyecto | Sesión arrancada fuera de cualquier repo: `activate_project("<ruta del repo>")` y reintenta — verificado, al activar un repo TS arranca el servidor `typescript` y la extracción de símbolos funciona. Arrancada dentro de un repo: esa sesión no puede tener otro proyecto (fila siguiente) — abre una sesión en el otro repo |
 | El agente afirma que `semantic_query` / `activate_project` «no existen» | `semantic_query` es un **parámetro de `search_graph`**, no una herramienta, así que buscarlo en la lista de herramientas falla. `activate_project` solo existe en una sesión arrancada **fuera** de cualquier repo, donde una búsqueda por palabras clave simplemente lo posiciona mal. Dentro de un repo, el contexto `claude-code` es de proyecto único (`single_project: true`) y lo elimina a propósito: 21 herramientas en vez de 23 | Usa `search_graph(semantic_query=["a","b"])`; selecciona `activate_project` por su nombre exacto. Si de verdad no está, la sesión está ligada a su repo: trabaja con otro repo desde una sesión arrancada en él |
 | `detect_changes` devuelve `seed_symbols: 0` pese a haber muchos archivos cambiados | Compara contra `base_branch` (por defecto `main`) o `since` — los cambios sin commitear del árbol de trabajo no resuelven a símbolos | Haz commit primero, pasa el `base_branch`/`since` correcto, o usa `trace_path` para el radio de impacto |
 | `uv tool install --force` falla: *"failed to remove directory … reparse point … (os error 4395)"* | Error engañoso — normalmente no hay ningún reparse point. Detén todos los `serena.exe`; si persiste, hay que borrar el directorio a la fuerza | `robocopy <dir-vacío> <dir-herramienta> /MIR`, luego `rmdir /s /q` y reinstala |
-| Tras reinstalar, `serena --version` muestra `2.0.0.dev0` y `activate_project` exige un `session_id` | Una instalación sin pin toma el `main` de Serena, que desde el 2026-09-15 es la línea 2.0 aún sin publicar: `activate_project` necesita un `session_id` de `initial_instructions`, que la forma `activate_project("<ruta>")` de [`CLAUDE.md`](CLAUDE.md) no pasa, y la aplicación pasa a licencia GPL-3.0 | Reinstala con el comando fijado del paso 4 más `--force` |
+| Tras reinstalar, `serena --version` muestra `2.0.0.dev0` y `activate_project` exige un `session_id` | Una instalación sin pin toma el `main` de Serena, que desde el 2026-09-15 es la línea 2.0 aún sin publicar: `activate_project` necesita un `session_id` de `initial_instructions`, que la forma `activate_project("<ruta>")` de [`CLAUDE.md`](CLAUDE.md) no pasa, y la aplicación pasa a licencia GPL-3.0 | Reinstala con el comando fijado del paso 3 más `--force` |
 | **Todos los plugins aparecen `Disabled` de golpe y no se pueden reactivar** | Algo reescribió `~/.claude/settings.json` con un **BOM** UTF-8 — exactamente lo que hace `Set-Content -Encoding UTF8` en PowerShell 5.1. Un `EF BB BF` inicial hace que un parser JSON estricto rechace el archivo entero, así que ninguna opción se aplica | Reescríbelo sin BOM: `node -e "const f=require('fs'),p='<archivo>';let s=f.readFileSync(p,'utf8');if(s.charCodeAt(0)===0xFEFF)s=s.slice(1);f.writeFileSync(p,JSON.stringify(JSON.parse(s),null,2))"`. Nunca pases la configuración de Claude por `Set-Content -Encoding UTF8`; usa `[System.IO.File]::WriteAllText($p,$json,(New-Object System.Text.UTF8Encoding($false)))` |
-| **`claude-mem.db` crece hasta gigabytes** aunque la memoria en sí ocupa ~100 MB | Cada cambio se escribe en `sync_outbox`, pero solo la sincronización en la nube la vacía; si nunca la configuraste, la cola solo crece: 3,6 M filas / 1,2 GB en seis semanas ([#4228](https://github.com/thedotmack/claude-mem/issues/4228)) | Actualiza claude-mem: en 13.28.0 el outbox se quedó en 0 filas tras más de 50 observaciones nuevas (#4228 cerrado como resuelto). Limpia lo acumulado una vez: detén el worker, `DELETE FROM sync_outbox`, `VACUUM` (aquí 1573 → 107 MB, en una segunda máquina 168 → 34 MB). [`prune-outbox.ts`](watchdog/prune-outbox.ts) lo sigue haciendo a diario desde el watchdog para versiones anteriores y no toca la cola si la sincronización *está* configurada |
 | Un script de PowerShell 5.1 muere con *"The property cannot be found on this object"* | En 5.1, `$json.NewKey = value` lanza excepción para claves ausentes en un objeto de `ConvertFrom-Json` | `Add-Member -NotePropertyName ... -Force` |
 | Una variable de ruta se convierte en algo como `MSFT_TaskSettings3` | Los nombres de variable en PowerShell **no distinguen mayúsculas** — `$settings` pisa silenciosamente a `$Settings` | Renombra una de las dos |
 | La salida de un `.exe` nativo aparece en rojo como `NativeCommandError` | PowerShell envuelve así el stderr de un programa nativo; el programa no falló | Mira el código de salida, no el color |
 
 ## Coste y consumo
 
-**codebase-memory-mcp** y **Serena** son gratis y totalmente locales. Solo **claude-mem** cobra por observación — con el proxy, eso sale de tu saldo de Ollama Cloud.
+**codebase-memory-mcp** y **Serena** son gratis y totalmente locales. **quipu** gasta cuota de Ollama Cloud — ~6,4k tokens de entrada por llamada de compresión; 112 llamadas cubrieron dos horas de cuatro sesiones en paralelo — y, solo cuando esa se agota, tu plan de Codex o de Claude, limitado a 20 llamadas por hora cada uno.
 
 | | Disco | Memoria |
 |---|---|---|
+| quipu | binarios de ~30 MB + 3 MB; la base de datos crece con el uso (~500 MB aquí, la mayor parte de los 49 mil registros importados de claude-mem) | ninguna propia — corre dentro del `engram mcp` de cada sesión |
 | codebase-memory-mcp | binario de 282 MB + caché del grafo (~450 MB para 19 repos / 111 mil nodos) | un demonio |
 | Serena | poco | ~1,6 GB con los language servers y varias sesiones abiertas |
-| claude-mem | SQLite + Chroma, crece con el uso | worker + stack de embeddings |
 
 ## Privacidad
 
-El grafo y Serena son totalmente locales. claude-mem **sí** envía contenido de la conversación a un modelo — el proxy revisa los cuerpos de los mensajes y sustituye las credenciales por `[SECRET:{type}]` antes de reenviar, registrando `[redacted: ...]` cuando actúa. Mantén `CMP_REDACT` activado.
+El grafo y Serena son totalmente locales. quipu **sí** envía a un modelo, para comprimirlo, lo que hizo el agente — pero la censura se ejecuta en el hook de captura, antes de que el evento se escriba en disco: claves de API, tokens, JWT, credenciales en URL, secretos de `.env` / YAML / JSON, cabeceras `Authorization`, bloques PEM y frases semilla se convierten en `[SECRET:{type}]`, y los archivos que solo se leyeron nunca se envían con su contenido. La memoria en sí se queda en `~/.engram/engram.db`.
 
 ## Licencia
 
-[MIT](LICENSE). Las cuatro herramientas documentadas tienen sus propias licencias.
+[MIT](LICENSE). Las tres herramientas documentadas tienen sus propias licencias.
