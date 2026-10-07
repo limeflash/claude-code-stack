@@ -115,6 +115,21 @@ if ((Test-Path $bun) -and (-not (Test-Path $stamp) -or ((Get-Date) - (Get-Item $
     Set-Content -Path $stamp -Value (Get-Date -Format o)
 }
 
+# Reap stuck hook processes. Each claude-mem hook is a short-lived bun running
+# "worker-service.cjs hook ..."; a healthy one exits in seconds. When the worker
+# is slow or gone they hang, and on Windows Claude Code's hook timeout kills only
+# the bash wrapper -- the bun child lives on, ~170 MB each. Matching "hook " in
+# the command line never hits the worker itself ("... start"), the proxy, or
+# anything outside claude-mem.
+$stuck = Get-CimInstance Win32_Process -Filter "Name='bun.exe'" | Where-Object {
+    $_.CommandLine -like '*worker-service.cjs*' -and $_.CommandLine -match '\shook\s' -and
+    ((Get-Date) - $_.CreationDate).TotalMinutes -gt 3
+}
+if ($stuck) {
+    Write-Log "reaping $(@($stuck).Count) stuck claude-mem hook process(es)"
+    $stuck | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+}
+
 # The proxy claude-mem generates through. Its own failure is quiet in the worst
 # way: the worker keeps reporting healthy while every request dies against a
 # closed port, so memory silently stops being written.

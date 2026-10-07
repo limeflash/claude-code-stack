@@ -20,5 +20,14 @@ for (const ev of TARGETS) {
   }
 }
 
+// Every hook invocation boots a fresh ~170 MB bun process that loads the whole
+// worker service. On "*" (PostToolUse) and Read (PreToolUse) that is one per
+// tool call in every session and subagent -- parallel agents spawned them
+// faster than they exited, 100+ at once. Capture only state-changing tools;
+// reads are noise in memory anyway.
+const CAPTURE = 'Edit|Write|MultiEdit|NotebookEdit|Bash|PowerShell';
+for (const group of j.hooks.PostToolUse || []) group.matcher = CAPTURE;
+delete j.hooks.PreToolUse;
+
 fs.writeFileSync(path, JSON.stringify(j, null, 2) + '\n', 'utf8');
-console.log(`wrapped=${wrapped} already_wrapped=${already}`);
+console.log(`wrapped=${wrapped} already_wrapped=${already} capture=${CAPTURE}`);
